@@ -95,7 +95,8 @@ Cancel discards them.
   global show/hide shortcut. Escape cancels recording and Backspace clears the shortcut.
   If nothing happens, your desktop already uses that combination. On Cinnamon, check
   System Settings → Keyboard → Shortcuts.
-- **Interface.** Tray icon, close-to-tray, start hidden and theme.
+- **Interface.** Start at login (adds File Minnow to your desktop's startup applications,
+  starting in the tray), tray icon, close-to-tray, start hidden and theme.
 
 Removing or excluding a folder never deletes files; it only removes them from the index.
 `/proc`, `/sys`, `/dev`, `/run` and File Minnow's own data folder are always skipped.

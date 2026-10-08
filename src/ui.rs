@@ -136,6 +136,8 @@ pub(crate) struct App {
     system_dark: bool,
     memory: WindowMemory,
     memory_path: PathBuf,
+    /// Data directory, for the login entry when it is not the default.
+    data_dir: PathBuf,
     memory_timer: Option<glib::SourceId>,
     /// Set when the window is shown from hidden; the map handler then asks
     /// the window manager for focus (see `desktop::x11_activate`).
@@ -383,6 +385,7 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
         system_dark,
         memory: WindowMemory::default(),
         memory_path: WindowMemory::path(&dir),
+        data_dir: dir.clone(),
         memory_timer: None,
         activate_on_map: Rc::new(Cell::new(false)),
         context_menu: None,
@@ -1644,8 +1647,21 @@ impl App {
         });
         let draft = options.draft.clone();
         let error = options.error_label.clone();
+        let autostart = options.autostart.clone();
         options.dialog.connect_response(move |dialog, response| {
             if matches!(response, gtk::ResponseType::Ok | gtk::ResponseType::Apply) {
+                if autostart.get() != file_ops::autostart_enabled() {
+                    let mut data_dir = None;
+                    with_app(&weak, |a| data_dir = Some(a.data_dir.clone()));
+                    let custom = data_dir.filter(|dir| {
+                        let default = crate::store::default_dir();
+                        default.canonicalize().unwrap_or(default) != *dir
+                    });
+                    if let Err(e) = file_ops::set_autostart(autostart.get(), custom.as_deref()) {
+                        error.set_text(&format!("Start at login: {e}"));
+                        return;
+                    }
+                }
                 let next = draft.borrow().clone();
                 match next.validate() {
                     Ok(()) => with_app(&weak, |a| {

@@ -29,6 +29,89 @@ pub fn guess_type(name: &Path) -> (glib::GString, bool) {
     }
 }
 
+/// The user's login autostart entry (XDG Autostart, read by Cinnamon, GNOME,
+/// KDE, Xfce, MATE, Budgie and others).
+pub fn autostart_path() -> Option<PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|d| Path::new(d).is_absolute())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(config.join("autostart/file-minnow.desktop"))
+}
+
+/// Whether File Minnow starts at login: our entry exists and is not
+/// switched off by the desktop's own startup settings.
+pub fn autostart_enabled() -> bool {
+    autostart_path().is_some_and(|p| autostart_enabled_at(&p))
+}
+fn autostart_enabled_at(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    !text.lines().map(str::trim).any(|line| {
+        line.eq_ignore_ascii_case("Hidden=true")
+            || line.eq_ignore_ascii_case("X-GNOME-Autostart-enabled=false")
+    })
+}
+
+/// Quotes an argument for a desktop entry's Exec line.
+fn exec_arg(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./+,:@".contains(c))
+    {
+        return arg.to_owned();
+    }
+    let mut quoted = String::from("\"");
+    for c in arg.chars() {
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    // `%` is a field code in Exec lines.
+    quoted.replace('%', "%%")
+}
+
+/// Creates or removes the login entry. It starts this same program (by name
+/// when it is the one on PATH) in the tray, with `data_dir` when that is not
+/// the default.
+pub fn set_autostart(enabled: bool, data_dir: Option<&Path>) -> Result<()> {
+    let path = autostart_path().context("Cannot find the autostart folder")?;
+    set_autostart_at(&path, enabled, data_dir)
+}
+fn set_autostart_at(path: &Path, enabled: bool, data_dir: Option<&Path>) -> Result<()> {
+    if !enabled {
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => return Ok(()),
+        }
+    }
+    let exe = std::env::current_exe().context("Cannot locate the File Minnow program")?;
+    let on_path = crate::actions::find_program("file-minnow")
+        .and_then(|p| p.canonicalize().ok())
+        .is_some_and(|p| exe.canonicalize().is_ok_and(|e| e == p));
+    let mut exec = if on_path {
+        "file-minnow".to_owned()
+    } else {
+        exec_arg(&exe.to_string_lossy())
+    };
+    if let Some(dir) = data_dir {
+        exec.push_str(" --data-dir ");
+        exec.push_str(&exec_arg(&dir.to_string_lossy()));
+    }
+    let entry = format!(
+        "[Desktop Entry]\nType=Application\nName=File Minnow\nComment=Start file search in the background\nExec={exec} gui --hidden\nIcon=file-minnow\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, entry)?;
+    Ok(())
+}
+
 /// Opens files with an application. Desktop applications get /dev/null
 /// for input and output, so a browser or editor started from File Minnow
 /// does not write its messages into the terminal File Minnow runs in.
@@ -289,6 +372,28 @@ mod tests {
         let (kind, uncertain) = guess_type(Path::new("/x/a.unknownext"));
         assert!(uncertain && !known_type(&kind), "{kind}");
         assert!(known_type(&guess_type(Path::new("/x/a.png")).0));
+    }
+
+    #[test]
+    fn autostart_entries() {
+        assert_eq!(exec_arg("/usr/bin/file-minnow"), "/usr/bin/file-minnow");
+        assert_eq!(exec_arg("/home/a b/x"), "\"/home/a b/x\"");
+        assert_eq!(exec_arg("/p/$x\"%"), "\"/p/\\$x\\\"%%\"");
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("autostart/file-minnow.desktop");
+        assert!(!autostart_enabled_at(&path));
+        set_autostart_at(&path, true, Some(Path::new("/data dir"))).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("--data-dir \"/data dir\" gui --hidden"),
+            "{text}"
+        );
+        assert!(autostart_enabled_at(&path));
+        std::fs::write(&path, text.replace("enabled=true", "enabled=false")).unwrap();
+        assert!(!autostart_enabled_at(&path));
+        set_autostart_at(&path, false, None).unwrap();
+        assert!(!path.exists());
+        set_autostart_at(&path, false, None).unwrap();
     }
 
     #[test]

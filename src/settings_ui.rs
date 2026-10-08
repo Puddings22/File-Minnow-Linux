@@ -10,6 +10,8 @@ pub struct OptionsWindow {
     pub dialog: gtk::Dialog,
     pub draft: Rc<RefCell<Settings>>,
     pub error_label: gtk::Label,
+    /// "Start at login": desktop state (an autostart entry), not a setting.
+    pub autostart: Rc<Cell<bool>>,
     body: gtk::Notebook,
 }
 impl OptionsWindow {
@@ -45,6 +47,7 @@ impl OptionsWindow {
         let record: Rc<dyn Fn(bool)> = Rc::new(record);
         // While a shortcut is being recorded, every key belongs to the recorder.
         let recording = Rc::new(Cell::new(false));
+        let autostart = Rc::new(Cell::new(crate::file_ops::autostart_enabled()));
         body.append_page(
             &folders(&dialog, draft.clone(), error_label.clone()),
             Some(&gtk::Label::new(Some("Folders"))),
@@ -71,7 +74,7 @@ impl OptionsWindow {
             Some(&gtk::Label::new(Some("Keyboard"))),
         );
         body.append_page(
-            &appearance(draft.clone()),
+            &appearance(draft.clone(), autostart.clone()),
             Some(&gtk::Label::new(Some("Interface"))),
         );
         let key_dialog = dialog.clone();
@@ -97,6 +100,7 @@ impl OptionsWindow {
             dialog,
             draft,
             error_label,
+            autostart,
             body,
         }
     }
@@ -800,7 +804,7 @@ fn keyboard(
     );
     page
 }
-fn appearance(draft: Rc<RefCell<Settings>>) -> gtk::Box {
+fn appearance(draft: Rc<RefCell<Settings>>, autostart: Rc<Cell<bool>>) -> gtk::Box {
     let page = page();
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let theme = gtk::ComboBoxText::new();
@@ -824,6 +828,13 @@ fn appearance(draft: Rc<RefCell<Settings>>) -> gtk::Box {
         });
     }
     page.pack_start(&caption("Fonts, selection colors, buttons and dialogs use the native desktop toolkit. Animations and kinetic scrolling are disabled."),false,false,4);
+    let login = gtk::CheckButton::with_label("Start File Minnow at login (in the tray)");
+    login.set_active(autostart.get());
+    login.set_tooltip_text(Some(
+        "Adds File Minnow to your desktop's startup applications, so the global shortcut works right after login.",
+    ));
+    login.connect_toggled(move |b| autostart.set(b.is_active()));
+    page.pack_start(&login, false, false, 0);
     for (label, field, value) in [
         ("Show a tray icon", 0, draft.borrow().ui.tray_enabled),
         (

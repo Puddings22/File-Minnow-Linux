@@ -80,10 +80,9 @@ there.
 
 Choose one of these, or neither:
 
-- **Window in the tray at login.** Copy `packaging/file-minnow-autostart.desktop` (installed
-  as `/usr/share/doc/file-minnow/file-minnow-autostart.desktop`) into
-  `~/.config/autostart/`. It starts `file-minnow gui --hidden`; without a working tray the
-  window stays visible.
+- **Window in the tray at login.** Tick **Options → Interface → Start File Minnow at login**.
+  This writes `~/.config/autostart/file-minnow.desktop`, which starts `file-minnow gui --hidden`;
+  without a working tray the window stays visible. Untick it to remove the entry.
 - **Background index service.** The package installs a systemd *user* unit but does not
   enable it. Enable it with `systemctl --user enable --now file-minnow.service`; the window
   attaches to it when opened. Without systemd, start `file-minnow daemon` with your

@@ -140,7 +140,7 @@ try:
                 with client.makefile('rb') as response:
                     return json.loads(response.readline())
 
-        KEYBOARD_TAB, FILE_TYPES_TAB = 4, 2
+        KEYBOARD_TAB, FILE_TYPES_TAB, INTERFACE_TAB = 4, 2, 5
         def open_tab(options_window, index):
             """Selects an Options tab by keyboard, independent of label widths."""
             xdo('mousemove', '--window', options_window, '40', '29', 'click', '1')
@@ -338,7 +338,7 @@ try:
         subprocess.run(['import', '-quiet', '-window', window, str(output / 'type-filter.png')], env=env, check=True)
         choose_filter('Up', 'Up', 'Up')
         wait_window(lambda s: s['filter'] == '')
-        menu_checks = {'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
+        menu_checks = {'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
         # Excluded file types: the default list hides *.tmp.
         assert request({'command': 'search', 'query': 'scratch', 'sort': 'Name', 'descending': False, 'limit': 10, 'offset': 0})['search']['total'] == 0, 'default file types were indexed'
         xdo('windowfocus', '--sync', window)
@@ -349,6 +349,25 @@ try:
         subprocess.run(['import', '-quiet', '-window', options_window, str(output / 'file-types.png')], env=env, check=True)
         xdo('key', 'Escape')
         wait_window(lambda s: not s['settings_open'])
+        # Options > Interface > Start at login writes and removes the XDG
+        # autostart entry (private XDG_CONFIG_HOME).
+        login_entry = Path(os.environ['XDG_CONFIG_HOME']) / 'autostart' / 'file-minnow.desktop'
+        for expected in [True, False]:
+            xdo('windowfocus', '--sync', window)
+            xdo('key', 'ctrl+comma')
+            wait_window(lambda s: s['settings_open'])
+            options_window = xdo('search', '--sync', '--onlyvisible', '--name', '^File Minnow Options$').splitlines()[0]
+            open_tab(options_window, INTERFACE_TAB)
+            xdo('mousemove', '--window', options_window, '35', '168', 'click', '1')  # the login check box
+            time.sleep(.2)
+            if expected:
+                subprocess.run(['import', '-quiet', '-window', options_window, str(output / 'interface.png')], env=env, check=True)
+            xdo('key', 'ctrl+Return')
+            wait_window(lambda s: not s['settings_open'])
+            assert login_entry.exists() == expected, f'login entry exists={login_entry.exists()}'
+            if expected:
+                text = login_entry.read_text()
+                assert 'gui --hidden' in text and '--data-dir' in text, text
         preferences = request({'command': 'settings'})['settings']
         assert preferences['index']['exclude_file_types'] and 'tmp' in preferences['index']['excluded_file_types']
         preferences['index']['excluded_files'] = ['*.txt']
