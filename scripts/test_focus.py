@@ -149,6 +149,22 @@ try:
         check('shortcut_from_behind', lambda: xdo('key', xdotool_chord), False)
         check('second_launch_from_hidden', lambda: subprocess.run([binary, '--data-dir', str(cache), 'show'], env=env, timeout=10, capture_output=True), True)
         # Escape closes (to the tray here).
+        # The window comes back where it was hidden, not where the window
+        # manager would place a new window.
+        window_state('show')
+        wait(lambda: window_state()['visible'], 'shown before moving')
+        ours = xdo('search', '--sync', '--onlyvisible', '--pid', str(app.pid), '--name', '^File Minnow$').splitlines()[0]
+        xdo('windowmove', '--sync', ours, '420', '260')
+        time.sleep(1.5)  # the position is recorded from configure events
+        geometry = lambda: xdo('getwindowgeometry', ours).splitlines()[1].split('Position:')[1].split('(')[0].strip()
+        before = geometry()
+        window_state('hide')
+        wait(lambda: not window_state()['visible'], 'hidden before showing again')
+        xdo('key', xdotool_chord)
+        wait(lambda: window_state()['visible'], 'shown again by the shortcut')
+        time.sleep(.5)
+        after = geometry()
+        results['position_kept_after_hide'] = True if after == before else f'FAILED: {before} became {after}'
         window_state('show')
         wait(lambda: window_state()['visible'], 'shown before Escape')
         ours = xdo('search', '--sync', '--onlyvisible', '--pid', str(app.pid), '--name', '^File Minnow$').splitlines()[0]

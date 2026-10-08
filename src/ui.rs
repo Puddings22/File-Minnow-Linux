@@ -1150,6 +1150,20 @@ impl App {
     fn show(&mut self) {
         let mapped = self.window.is_mapped();
         self.activate_on_map.set(!mapped);
+        if !mapped {
+            // A hidden window is placed by the window manager like a new one
+            // (top left on Muffin) unless we ask for its last position.
+            if self.memory.maximized {
+                self.window.maximize();
+            } else if let (Some(x), Some(y)) = (self.memory.x, self.memory.y)
+                && on_screen(x, y, self.memory.width)
+            {
+                if self.memory.width > 0 && self.memory.height > 0 {
+                    self.window.resize(self.memory.width, self.memory.height);
+                }
+                self.window.move_(x, y);
+            }
+        }
         self.window.show_all();
         if self
             .data
@@ -1184,6 +1198,15 @@ impl App {
         if self.tray_available {
             if let Some(options) = &self.options {
                 options.dialog.hide();
+            }
+            // Where the window is now is where it comes back (`show`).
+            if self.window.is_visible() && !self.memory.maximized {
+                let (x, y) = self.window.position();
+                let (width, height) = self.window.size();
+                self.memory.x = Some(x);
+                self.memory.y = Some(y);
+                self.memory.width = width;
+                self.memory.height = height;
             }
             self.save_memory();
             self.window.hide();
