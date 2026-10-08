@@ -32,12 +32,12 @@ test "$(file-minnow --data-dir /tmp/minnow-cache search ext:pdf)" = /tmp/minnow-
 
 # The GUI's native libraries must be covered by the application package. These
 # additional packages are the isolated test infrastructure and software renderer.
-apt-get install -y --no-install-recommends xvfb xdotool imagemagick dbus-x11 python3 python3-dbus python3-gi python3-xlib libgl1-mesa-dri
+apt-get install -y --no-install-recommends xvfb xdotool xclip imagemagick dbus-x11 python3 python3-dbus python3-gi gir1.2-glib-2.0 python3-xlib libgl1-mesa-dri
 python3 /tests/test_ui.py --binary /usr/bin/file-minnow --tray --output /tmp/minnow-ui-proof
 cat /tmp/minnow-ui-proof/result.json
 dpkg --remove file-minnow
 test ! -e /usr/bin/file-minnow
 test ! -e /usr/share/applications/org.fileminnow.FileMinnow.desktop
 test "$(sha256sum /tmp/minnow-cache/settings.json)" = "$settings_before"
-test -f /tmp/minnow-cache/index.sqlite
+test -f /tmp/minnow-cache/index.bin
 printf 'FILE_MINNOW_DEB_QA_PASS: install, upgrade, native UI, remove, user data preserved\n'
