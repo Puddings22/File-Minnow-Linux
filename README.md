@@ -39,6 +39,19 @@ File Minnow is built for exactly that.
 
 ## Install
 
+### Download (Ubuntu, Linux Mint, Debian and others)
+
+Get the latest `.deb` or portable archive from
+**[Releases](https://github.com/Puddings22/File-Minnow-Linux/releases/latest)**, then:
+
+```bash
+sudo apt install ./file-minnow_*_amd64.deb
+```
+
+The `.deb` works on Ubuntu 22.04+, Linux Mint 21+, Debian 12+ and their derivatives. The
+portable `.tar.gz` runs on other 64-bit glibc distributions with GTK 3 (Fedora, openSUSE,
+Arch…).
+
 ### Build from source
 
 Install Rust (via [rustup](https://rustup.rs)) and the GTK 3 development files:
