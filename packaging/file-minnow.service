@@ -1,0 +1,11 @@
+[Unit]
+Description=File Minnow per-user filename index
+
+[Service]
+ExecStart=/usr/bin/file-minnow daemon
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

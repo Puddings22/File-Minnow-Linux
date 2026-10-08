@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=File Minnow
+Comment=Start file search in the background
+Exec=file-minnow gui --hidden
+Icon=file-minnow
+Terminal=false
+X-GNOME-Autostart-enabled=true

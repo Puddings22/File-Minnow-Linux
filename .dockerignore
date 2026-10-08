@@ -1,0 +1,7 @@
+target
+dist
+.dev
+artifacts
+work
+.git
+.claude

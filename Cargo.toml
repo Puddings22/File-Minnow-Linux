@@ -1,0 +1,52 @@
+[package]
+name = "file-minnow"
+version = "0.7.0"
+edition = "2024"
+description = "Instant file search for Linux: a fast, lightweight Everything alternative with a native GTK UI, live index, global hotkey and tray icon"
+license = "MIT"
+repository = "https://github.com/Puddings22/File-Minnow-Linux"
+homepage = "https://github.com/Puddings22/File-Minnow-Linux"
+readme = "README.md"
+keywords = ["file-search", "everything", "linux", "desktop-search", "gtk"]
+categories = ["filesystem", "command-line-utilities", "gui"]
+
+[features]
+default = ["gui"]
+gui = ["dep:gtk", "dep:gio", "dep:ksni", "dep:x11rb", "dep:ashpd", "dep:async-io", "dep:async-channel", "dep:futures-lite"]
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+gtk = { version = "0.18.2", features = ["v3_24"], optional = true }
+# Same gio as gtk re-exports; v2_58 adds launching with redirected output.
+gio = { version = "0.18.4", features = ["v2_58"], optional = true }
+ksni = { version = "0.3.6", default-features = false, features = ["async-io", "blocking"], optional = true }
+x11rb = { version = "0.13", features = ["xkb"], optional = true }
+ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "global_shortcuts"], optional = true }
+async-io = { version = "2", optional = true }
+async-channel = { version = "2", optional = true }
+futures-lite = { version = "2", optional = true }
+inotify = { version = "0.11", default-features = false }
+libc = "0.2"
+regex = "1"
+memchr = "2"
+globset = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "file-minnow"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[profile.dev]
+debug = 0

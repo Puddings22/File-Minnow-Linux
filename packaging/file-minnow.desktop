@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=File Minnow
+Comment=Search indexed file and folder names
+Exec=file-minnow gui
+Icon=file-minnow
+Terminal=false
+Categories=Utility;FileTools;
+Keywords=search;files;folders;
+StartupWMClass=org.fileminnow.FileMinnow
+StartupNotify=true
+Actions=Show;
+
+[Desktop Action Show]
+Name=Show File Minnow
+Exec=file-minnow show

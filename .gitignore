@@ -1,0 +1,17 @@
+# Build output
+/target/
+/dist/
+
+# Local development tools (GTK SDK, Xvfb) and test/benchmark output
+/.dev/
+/artifacts/
+/work/
+__pycache__/
+*.pyc
+
+# Editor and assistant settings
+/.claude/
+/.vscode/
+/.idea/
+*.swp
+*~
