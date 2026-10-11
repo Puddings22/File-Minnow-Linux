@@ -369,6 +369,11 @@ fn chooser(parent: &gtk::Dialog, title: &str, done: impl Fn(Vec<std::path::PathB
     );
     dialog.set_modal(true);
     dialog.set_select_multiple(true);
+    if crate::file_ops::confined()
+        && let Some(home) = crate::file_ops::real_home()
+    {
+        dialog.set_current_folder(home);
+    }
     dialog.connect_response(move |d, r| {
         if r == gtk::ResponseType::Accept {
             done(d.filenames());

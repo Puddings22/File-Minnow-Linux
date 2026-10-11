@@ -1381,8 +1381,18 @@ fn popup(w: &AppWeak, event: Option<&gdk::EventButton>) {
         on(|a| a.open_selected(false)),
     );
     // Open With: the desktop's applications for this type, default first.
+    // A snap sees only its own applications; the portal asks instead.
     let kind = items[0].mime.clone();
-    if items.iter().all(|i| i.mime == kind) {
+    if file_ops::confined() {
+        if items.len() == 1 {
+            menu_item(
+                &menu,
+                "Open _With…",
+                None,
+                on(|a| a.portal_selected(file_ops::Portal::OpenWith)),
+            );
+        }
+    } else if items.iter().all(|i| i.mime == kind) {
         let submenu = gtk::Menu::new();
         let default = gio::AppInfo::default_for_type(&kind, false);
         let mut apps: Vec<gio::AppInfo> = default.iter().cloned().collect();
@@ -1419,7 +1429,9 @@ fn popup(w: &AppWeak, event: Option<&gdk::EventButton>) {
         None,
         on(|a| a.show_in_folder()),
     );
-    menu_item(&menu, "Open in Ter_minal", None, on(App::terminal_here));
+    if !file_ops::confined() {
+        menu_item(&menu, "Open in Ter_minal", None, on(App::terminal_here));
+    }
     separator(&menu);
     menu_item(
         &menu,
@@ -1464,7 +1476,14 @@ fn popup(w: &AppWeak, event: Option<&gdk::EventButton>) {
             .as_deref(),
     );
     let mut submenus: Vec<(String, gtk::Menu)> = Vec::new();
-    for action in actions::load(manager) {
+    // A snap cannot run the file manager's actions and scripts.
+    let confined = file_ops::confined();
+    let loaded = if confined {
+        Vec::new()
+    } else {
+        actions::load(manager)
+    };
+    for action in loaded {
         if !action.applies(&items, &file_ops::bus_has_owner) {
             continue;
         }
@@ -1492,7 +1511,11 @@ fn popup(w: &AppWeak, event: Option<&gdk::EventButton>) {
             item.set_tooltip_text(Some(&tip));
         }
     }
-    let scripts = actions::scripts(manager);
+    let scripts = if confined {
+        Vec::new()
+    } else {
+        actions::scripts(manager)
+    };
     if !scripts.is_empty() {
         let submenu = gtk::Menu::new();
         for script in scripts {
@@ -2454,6 +2477,11 @@ impl App {
         );
         chooser.set_modal(true);
         chooser.set_select_multiple(true);
+        if file_ops::confined()
+            && let Some(home) = file_ops::real_home()
+        {
+            chooser.set_current_folder(home);
+        }
         let weak = Rc::downgrade(app);
         chooser.connect_response(move |dialog, response| {
             if response == gtk::ResponseType::Accept {
@@ -2586,11 +2614,31 @@ impl App {
         if paths.is_empty() {
             return;
         }
+        if file_ops::confined() {
+            self.portal_selected(file_ops::Portal::ShowInFolder);
+            return;
+        }
         let tx = self.messages.clone();
         let fallback = paths.clone();
         file_ops::file_manager("ShowItems", &paths, move |answered| {
             if !answered {
                 open_paths(fallback, true, tx);
+            }
+        });
+    }
+    /// Asks the desktop portal to act on the selection, off the main thread.
+    fn portal_selected(&mut self, action: file_ops::Portal) {
+        let paths = self.selected_paths();
+        let tx = self.messages.clone();
+        std::thread::spawn(move || {
+            for path in paths.iter().take(20) {
+                if let Err(e) = file_ops::portal(action, path) {
+                    let _ = tx.send_blocking(Message::Error(format!(
+                        "Cannot open {}: {e}",
+                        path.display()
+                    )));
+                    break;
+                }
             }
         });
     }
@@ -2880,11 +2928,15 @@ fn open_paths(paths: Vec<PathBuf>, parent: bool, tx: async_channel::Sender<Messa
             let result = std::fs::symlink_metadata(&path)
                 .map_err(anyhow::Error::from)
                 .and_then(|_| {
-                    file_ops::spawn(
-                        &["xdg-open".into(), path.clone().into_os_string()],
-                        None,
-                        &[],
-                    )
+                    if file_ops::confined() {
+                        file_ops::portal(file_ops::Portal::Open, &path)
+                    } else {
+                        file_ops::spawn(
+                            &["xdg-open".into(), path.clone().into_os_string()],
+                            None,
+                            &[],
+                        )
+                    }
                 });
             if let Err(error) = result {
                 let _ = tx.send_blocking(Message::Error(format!(

@@ -29,6 +29,69 @@ pub fn guess_type(name: &Path) -> (glib::GString, bool) {
     }
 }
 
+/// Whether File Minnow runs as a confined snap. A snap cannot start the
+/// computer's other programs or call the file manager directly, so opening
+/// files, showing them in their folder and the trash go through the desktop
+/// portals, and menu entries that run programs are left out.
+pub fn confined() -> bool {
+    std::env::var_os("SNAP").is_some()
+}
+
+/// The user's home folder. In a snap, `HOME` is the snap's own folder.
+pub fn real_home() -> Option<PathBuf> {
+    std::env::var_os("SNAP_REAL_HOME")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+/// What a desktop portal request does with a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Portal {
+    /// Open with the default application.
+    Open,
+    /// Ask which application opens it.
+    OpenWith,
+    /// Show it selected in its folder.
+    ShowInFolder,
+    Trash,
+}
+
+/// Asks the desktop portal (org.freedesktop.portal.OpenURI or .Trash) to
+/// act on a file, and waits for the answer. A cancelled choice is not an
+/// error.
+pub fn portal(action: Portal, path: &Path) -> Result<()> {
+    use ashpd::desktop::{ResponseError, open_uri, trash};
+    use std::os::unix::fs::OpenOptionsExt;
+    // The portal resolves the path from the descriptor; O_PATH also works
+    // for folders and unreadable files. Trash acts on a link, not its target.
+    let mut flags = libc::O_PATH | libc::O_CLOEXEC;
+    if action == Portal::Trash {
+        flags |= libc::O_NOFOLLOW;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)?;
+    let result = async_io::block_on(async {
+        match action {
+            Portal::Open | Portal::OpenWith => open_uri::OpenFileRequest::default()
+                .ask(action == Portal::OpenWith)
+                .send_file(&file)
+                .await?
+                .response(),
+            Portal::ShowInFolder => open_uri::OpenDirectoryRequest::default()
+                .send(&file)
+                .await?
+                .response(),
+            Portal::Trash => trash::trash_file(&file).await,
+        }
+    });
+    match result {
+        Ok(()) | Err(ashpd::Error::Response(ResponseError::Cancelled)) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// The user's login autostart entry (XDG Autostart, read by Cinnamon, GNOME,
 /// KDE, Xfce, MATE, Budgie and others).
 pub fn autostart_path() -> Option<PathBuf> {
@@ -309,10 +372,15 @@ pub fn trash(paths: &[PathBuf]) -> Vec<String> {
     paths
         .iter()
         .filter_map(|path| {
-            gio::File::for_path(path)
-                .trash(None::<&gio::Cancellable>)
-                .err()
-                .map(|e| format!("{}: {}", path.display(), e.message()))
+            let error = if confined() {
+                portal(Portal::Trash, path).err().map(|e| e.to_string())
+            } else {
+                gio::File::for_path(path)
+                    .trash(None::<&gio::Cancellable>)
+                    .err()
+                    .map(|e| e.message().to_owned())
+            };
+            error.map(|e| format!("{}: {e}", path.display()))
         })
         .collect()
 }
@@ -342,7 +410,12 @@ pub fn bus_has_owner(name: &str) -> bool {
 /// Nautilus, Caja, Dolphin, Thunar...) to show items selected in their
 /// folder (`ShowItems`) or their properties window (`ShowItemProperties`).
 /// `done(false)` when no file manager answered, so callers can fall back.
+/// A snap may not call it.
 pub fn file_manager(method: &str, paths: &[PathBuf], done: impl FnOnce(bool) + 'static) {
+    if confined() {
+        done(false);
+        return;
+    }
     let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>) else {
         done(false);
         return;

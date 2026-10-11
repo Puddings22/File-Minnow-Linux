@@ -38,7 +38,7 @@ jobs:
           touch "$HOME/minnow-test/Știință/report-2026.pdf" "$HOME/minnow-test/notes.txt"
           file-minnow paths
           file-minnow index --root "$HOME/minnow-test"
-          file-minnow search stiinta report | tee result.txt
+          file-minnow search "stiinta report" | tee result.txt
           grep -q "report-2026.pdf" result.txt
           file-minnow status
 

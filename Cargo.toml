@@ -23,7 +23,7 @@ gtk = { version = "0.18.2", features = ["v3_24"], optional = true }
 gio = { version = "0.18.4", features = ["v2_58"], optional = true }
 ksni = { version = "0.3.6", default-features = false, features = ["async-io", "blocking"], optional = true }
 x11rb = { version = "0.13", features = ["xkb"], optional = true }
-ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "global_shortcuts"], optional = true }
+ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "global_shortcuts", "open_uri", "trash"], optional = true }
 async-io = { version = "2", optional = true }
 async-channel = { version = "2", optional = true }
 futures-lite = { version = "2", optional = true }

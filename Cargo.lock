@@ -86,6 +86,7 @@ dependencies = [
  "futures-util",
  "getrandom",
  "serde",
+ "serde_repr",
  "zbus",
 ]
 

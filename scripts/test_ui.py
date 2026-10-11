@@ -21,6 +21,7 @@ parser.add_argument('--output', default='artifacts/ui')
 parser.add_argument('--tray', action='store_true')
 parser.add_argument('--daemon-first', action='store_true')
 parser.add_argument('--portal', action='store_true', help='Test the Wayland shortcut protocol with a private fixture; rendering still uses Xvfb')
+parser.add_argument('--confined', action='store_true', help='Run as a snap would: files open, show and trash through the (fixture) desktop portal')
 args = parser.parse_args()
 if os.environ.get('MINNOW_PRIVATE_TEST_SESSION') != '1':
     # The GTK file chooser can start GVfs in the private session; keep its
@@ -62,6 +63,9 @@ try:
         raise RuntimeError('Invalid virtual display identifier')
     env = os.environ.copy()
     env.update(DISPLAY=f':{number}', XDG_SESSION_TYPE='x11', LIBGL_ALWAYS_SOFTWARE='1')
+    if args.confined:
+        # File Minnow only reads these; nothing runs from this path.
+        env.update(SNAP='/snap/file-minnow/x1', SNAP_NAME='file-minnow', SNAP_REAL_HOME=os.environ.get('HOME', '/'))
     env.pop('WAYLAND_DISPLAY', None)
     subprocess.run(['dbus-update-activation-environment', 'DISPLAY=' + env['DISPLAY'], 'XDG_SESSION_TYPE=x11'], env=env, check=True)
     with tempfile.TemporaryDirectory(prefix='file-minnow-ui-') as temp:
@@ -271,29 +275,57 @@ try:
             xdo('key', key)
             time.sleep(.3)
         target = files / 'lib.rs'
-        right_click_first('z')  # the private Nemo action fixture
-        deadline = time.monotonic() + 5
-        while not (marker / 'lib.rs').exists():
-            assert time.monotonic() < deadline, 'Nemo action did not run'
-            time.sleep(.05)
-        right_click_first('w')  # Open _With: the default application comes first
-        xdo('key', 'Return')
-        deadline = time.monotonic() + 5
-        while not (marker / 'opened').exists() or not (marker / 'opened').read_text().strip():
-            assert time.monotonic() < deadline, 'Open With did not start the application'
-            time.sleep(.05)
-        assert (marker / 'opened').read_text().strip() == str(target)
-        time.sleep(.2)
-        assert 'noise-from-viewer' not in (output / 'application.log').read_text(), 'launched application wrote into File Minnow output'
-        portal_proxy = __import__('dbus').SessionBus().get_object('org.freedesktop.FileManager1', '/org/freedesktop/FileManager1')
-        def file_manager_calls():
-            return [(str(m), [str(u) for u in uris]) for m, uris in portal_proxy.Calls(dbus_interface='org.fileminnow.TestPortal')]
-        right_click_first('e')  # Prop_erties
-        right_click_first('f')  # Open Containing _Folder
-        deadline = time.monotonic() + 5
-        while file_manager_calls() != [('ShowItemProperties', [target.as_uri()]), ('ShowItems', [target.as_uri()])]:
-            assert time.monotonic() < deadline, f'file manager calls: {file_manager_calls()}'
-            time.sleep(.05)
+        if args.confined:
+            # A snap cannot run the file manager's actions, list the desktop's
+            # applications or call the file manager: the portal does it.
+            right_click_first('z')
+            time.sleep(.5)
+            assert not (marker / 'lib.rs').exists(), 'Nemo action offered in a snap'
+            xdo('key', 'Escape')
+            desktop_portal = __import__('dbus').SessionBus().get_object('org.freedesktop.portal.Desktop', '/org/freedesktop/portal/desktop')
+            def portal_file_calls():
+                return [(str(m), str(p), bool(a)) for m, p, a in desktop_portal.FileCalls(dbus_interface='org.fileminnow.TestPortal')]
+            right_click_first('w')  # Open _With…: the portal asks for the application
+            right_click_first('f')  # Open Containing _Folder
+            right_click_first('o')  # _Open
+            expected = [('OpenFile', str(target), True), ('OpenDirectory', str(target), False), ('OpenFile', str(target), False)]
+            deadline = time.monotonic() + 5
+            while portal_file_calls() != expected:
+                assert time.monotonic() < deadline, f'portal calls: {portal_file_calls()}'
+                time.sleep(.05)
+            right_click_first('e')  # Prop_erties: File Minnow's own summary
+            properties = xdo('search', '--sync', '--onlyvisible', '--name', '^File Properties$').splitlines()[0]
+            xdo('windowfocus', '--sync', properties)
+            xdo('key', 'Escape')
+            deadline = time.monotonic() + 5
+            while subprocess.run(['xdotool', 'search', '--onlyvisible', '--name', '^File Properties$'], env=env, capture_output=True).returncode == 0:
+                assert time.monotonic() < deadline, 'Properties summary did not close'
+                time.sleep(.05)
+            assert not (marker / 'opened').exists(), 'a host application started from the snap'
+        else:
+            right_click_first('z')  # the private Nemo action fixture
+            deadline = time.monotonic() + 5
+            while not (marker / 'lib.rs').exists():
+                assert time.monotonic() < deadline, 'Nemo action did not run'
+                time.sleep(.05)
+            right_click_first('w')  # Open _With: the default application comes first
+            xdo('key', 'Return')
+            deadline = time.monotonic() + 5
+            while not (marker / 'opened').exists() or not (marker / 'opened').read_text().strip():
+                assert time.monotonic() < deadline, 'Open With did not start the application'
+                time.sleep(.05)
+            assert (marker / 'opened').read_text().strip() == str(target)
+            time.sleep(.2)
+            assert 'noise-from-viewer' not in (output / 'application.log').read_text(), 'launched application wrote into File Minnow output'
+            portal_proxy = __import__('dbus').SessionBus().get_object('org.freedesktop.FileManager1', '/org/freedesktop/FileManager1')
+            def file_manager_calls():
+                return [(str(m), [str(u) for u in uris]) for m, uris in portal_proxy.Calls(dbus_interface='org.fileminnow.TestPortal')]
+            right_click_first('e')  # Prop_erties
+            right_click_first('f')  # Open Containing _Folder
+            deadline = time.monotonic() + 5
+            while file_manager_calls() != [('ShowItemProperties', [target.as_uri()]), ('ShowItems', [target.as_uri()])]:
+                assert time.monotonic() < deadline, f'file manager calls: {file_manager_calls()}'
+                time.sleep(.05)
         # Ctrl+C puts the file itself on the clipboard (pastes in Nemo) and its path as text.
         xdo('key', 'ctrl+c')
         time.sleep(.2)
@@ -319,7 +351,7 @@ try:
         xdo('mousemove', '--window', window, '150', '107', 'click', '1')
         time.sleep(.2)
         xdo('key', 'Delete')
-        trash = Path(os.environ['XDG_DATA_HOME']) / 'Trash' / 'files' / 'renamed.rs'
+        trash = Path(os.environ['XDG_DATA_HOME']) / ('portal-trash' if args.confined else 'Trash/files') / 'renamed.rs'
         deadline = time.monotonic() + 5
         while not trash.exists():
             assert time.monotonic() < deadline, 'Delete did not move the file to the Trash'

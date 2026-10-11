@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Protocol fixture for GlobalShortcuts, never a replacement for compositor QA."""
+"""Protocol fixture for GlobalShortcuts, OpenURI and Trash, never a replacement for compositor QA."""
 import os
 import time
 import dbus
@@ -28,18 +28,46 @@ class Portal(dbus.service.Object):
         super().__init__(bus, '/org/freedesktop/portal/desktop')
         self.session = None
         self.shortcuts = []
+        self.file_calls = []
     def response(self, sender, options, values):
         path = '/org/freedesktop/portal/desktop/request/' + sender[1:].replace('.', '_') + '/' + str(options['handle_token'])
         request = Request(bus, path)
         objects.append(request)
         GLib.timeout_add(20, lambda: (request.Response(0, values), False)[1])
         return dbus.ObjectPath(path)
+    VERSIONS = {'org.freedesktop.portal.OpenURI': 4, 'org.freedesktop.portal.Trash': 1}
     @dbus.service.method('org.freedesktop.DBus.Properties', in_signature='ss', out_signature='v')
     def Get(self, interface, key):
-        return dbus.UInt32(2)
+        return dbus.UInt32(self.VERSIONS.get(interface, 2))
     @dbus.service.method('org.freedesktop.DBus.Properties', in_signature='s', out_signature='a{sv}')
     def GetAll(self, interface):
-        return {'version': dbus.UInt32(2)}
+        return {'version': dbus.UInt32(self.VERSIONS.get(interface, 2))}
+    # OpenURI and Trash, as a confined (snap) File Minnow uses them: the
+    # file arrives as a descriptor; record the path it resolves to.
+    def file_call(self, method, fd, options=None):
+        number = fd.take()
+        path = os.readlink(f'/proc/self/fd/{number}')
+        os.close(number)
+        self.file_calls.append((method, path, bool(options.get('ask', False)) if options else False))
+        return path
+    @dbus.service.method('org.freedesktop.portal.OpenURI', in_signature='sha{sv}', out_signature='o', sender_keyword='sender')
+    def OpenFile(self, parent, fd, options, sender=None):
+        self.file_call('OpenFile', fd, options)
+        return self.response(sender, options, {})
+    @dbus.service.method('org.freedesktop.portal.OpenURI', in_signature='sha{sv}', out_signature='o', sender_keyword='sender')
+    def OpenDirectory(self, parent, fd, options, sender=None):
+        self.file_call('OpenDirectory', fd, options)
+        return self.response(sender, options, {})
+    @dbus.service.method('org.freedesktop.portal.Trash', in_signature='h', out_signature='u')
+    def TrashFile(self, fd):
+        path = self.file_call('TrashFile', fd)
+        trash = os.path.join(os.environ['XDG_DATA_HOME'], 'portal-trash')
+        os.makedirs(trash, exist_ok=True)
+        os.rename(path, os.path.join(trash, os.path.basename(path)))
+        return dbus.UInt32(1)
+    @dbus.service.method('org.fileminnow.TestPortal', in_signature='', out_signature='a(ssb)')
+    def FileCalls(self):
+        return dbus.Array(self.file_calls, signature='(ssb)')
     @dbus.service.method('org.freedesktop.portal.GlobalShortcuts', in_signature='a{sv}', out_signature='o', sender_keyword='sender')
     def CreateSession(self, options, sender=None):
         path = '/org/freedesktop/portal/desktop/session/' + sender[1:].replace('.', '_') + '/' + str(options['session_handle_token'])
