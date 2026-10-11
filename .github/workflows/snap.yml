@@ -1,0 +1,72 @@
+name: Snap
+
+# Builds the snap in a clean LXD container, installs it and runs a search
+# through the confined app. A published GitHub release (or a manual run with a
+# channel) also uploads it to the Snap Store when the
+# SNAPCRAFT_STORE_CREDENTIALS secret is set.
+on:
+  push:
+    paths: ["snap/**", ".github/workflows/snap.yml"]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Also publish to this Snap Store channel (empty: build only)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  snap:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: snapcore/action-build@v1
+        id: build
+
+      - name: Install and search with the confined app
+        env:
+          SNAP_FILE: ${{ steps.build.outputs.snap }}
+        run: |
+          sudo snap install --dangerous "$SNAP_FILE"
+          snap connections file-minnow
+          mkdir -p "$HOME/minnow-test/Știință"
+          touch "$HOME/minnow-test/Știință/report-2026.pdf" "$HOME/minnow-test/notes.txt"
+          file-minnow paths
+          file-minnow index --root "$HOME/minnow-test"
+          file-minnow search stiinta report | tee result.txt
+          grep -q "report-2026.pdf" result.txt
+          file-minnow status
+
+      - name: Start the window on a virtual display
+        run: |
+          sudo apt-get install -y --no-install-recommends xvfb
+          xvfb-run -a sh -c 'timeout 15 file-minnow gui --hidden; code=$?; [ "$code" = 124 ]'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snap
+          path: ${{ steps.build.outputs.snap }}
+
+      - name: Check for Snap Store credentials
+        id: store
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+          WANTED: ${{ github.event_name == 'release' || inputs.channel != '' }}
+        run: |
+          if [ "$WANTED" = true ] && [ -n "$SNAPCRAFT_STORE_CREDENTIALS" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        if: steps.store.outputs.ready == 'true'
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        uses: snapcore/action-publish@v1
+        with:
+          snap: ${{ steps.build.outputs.snap }}
+          release: ${{ inputs.channel || 'stable' }}

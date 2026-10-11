@@ -1,0 +1,59 @@
+name: file-minnow
+title: File Minnow
+base: core22
+adopt-info: file-minnow
+summary: Instant file search for Linux, a fast Everything alternative
+description: |
+  File Minnow is an instant file search app for Linux. It indexes your file and
+  folder names once, keeps the index up to date in real time, and finds files as
+  you type, across millions of files, in milliseconds.
+
+  - Instant results on every keystroke, with a live index (inotify)
+  - Everything-style search syntax: AND, | (OR), ! (NOT), wildcards, ext:, size:,
+    dm:, dc:, path:, regex:, dupe:, empty:, parent:, child:, content: and type
+    filters such as pic: and doc:
+  - Accent- and case-insensitive search
+  - Native GTK interface, global hotkey and tray icon
+  - Bookmarks, search history, custom filters, export to CSV, preview pane
+  - Removable drives stay searchable while unplugged
+
+  The snap is confined: it can search your home folder and, after
+  `snap connect file-minnow:removable-media`, drives under /media and /mnt.
+  Hidden files directly inside your home folder (such as ~/.config) are not
+  readable by snaps. For whole-system search and your file manager's custom
+  right-click actions, use the .deb or the portable archive from GitHub.
+grade: stable
+confinement: strict
+license: MIT
+website: https://sites.google.com/view/file-minnow-linux
+source-code: https://github.com/Puddings22/File-Minnow-Linux
+issues: https://github.com/Puddings22/File-Minnow-Linux/issues
+contact: https://github.com/Puddings22/File-Minnow-Linux/issues
+icon: snap/gui/file-minnow.svg
+
+apps:
+  file-minnow:
+    command: bin/file-minnow
+    extensions: [gnome]
+    # Start at login: the app writes this entry into the snap's own
+    # ~/.config/autostart and snapd starts it with the user session.
+    autostart: file-minnow.desktop
+    environment:
+      # Open, Show in Folder and Trash go through the desktop portals.
+      GTK_USE_PORTAL: "1"
+    plugs:
+      - home
+      - removable-media
+      - mount-observe
+      - unity7
+
+parts:
+  file-minnow:
+    plugin: rust
+    source: .
+    rust-channel: stable
+    override-pull: |
+      craftctl default
+      craftctl set version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+    prime:
+      - bin/file-minnow
