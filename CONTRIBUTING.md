@@ -26,6 +26,7 @@ your desktop:
 python3 scripts/test_ui.py --xvfb /path/to/Xvfb            # window, search, options, menus
 python3 scripts/test_ui.py --xvfb /path/to/Xvfb --tray     # tray, global shortcut, close to tray
 python3 scripts/test_ui.py --xvfb /path/to/Xvfb --tray --portal --daemon-first
+python3 scripts/test_ui.py --xvfb /path/to/Xvfb --confined  # as a snap: portals for open, show, trash
 python3 scripts/test_focus.py --xvfb /path/to/Xvfb         # focus with Muffin as window manager
 ```
 

@@ -38,9 +38,13 @@ jobs:
           touch "$HOME/minnow-test/Știință/report-2026.pdf" "$HOME/minnow-test/notes.txt"
           file-minnow paths
           file-minnow index --root "$HOME/minnow-test"
-          file-minnow search "stiinta report" | tee result.txt
+          file-minnow search stiinta | tee result.txt
+          grep -q "Știință" result.txt
+          file-minnow search "ext:pdf" | tee result.txt
           grep -q "report-2026.pdf" result.txt
           file-minnow status
+          # What the confinement lets it read (informational).
+          snap run --shell file-minnow -c 'wc -l /proc/self/mountinfo; ls -d /media /mnt "$SNAP_REAL_HOME/.config"' || true
 
       - name: Start the window on a virtual display
         run: |

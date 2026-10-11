@@ -76,6 +76,29 @@ installed with any desktop), a user D-Bus session for the tray and portals, and
 A glibc build does not run on musl-based systems such as Alpine; build from source
 there.
 
+## Snap
+
+`snap/snapcraft.yaml` builds a strictly confined snap (core22 base, GNOME extension).
+`.github/workflows/snap.yml` builds it in a clean LXD container, installs it and runs a
+search with it; a published GitHub release also uploads it to the Snap Store when the
+repository has a `SNAPCRAFT_STORE_CREDENTIALS` secret. To build it yourself, run
+`snapcraft pack` (it needs snapd and LXD or Multipass).
+
+A confined snap works differently from the package:
+
+- It can index your **home folder**, except hidden files and folders directly inside it
+  (`~/.config`, `~/.cache`…). Drives under `/media`, `/run/media` and `/mnt` need
+  `snap connect file-minnow:removable-media`. Recognising network folders and drives
+  being plugged in needs `snap connect file-minnow:mount-observe`. System folders such
+  as `/usr` or `/etc` belong to the snap's own runtime, so indexing them is not useful.
+- Open, Open With, Open Containing Folder and Move to Trash go through the desktop
+  portal (`xdg-desktop-portal`). Open in Terminal and the file manager's custom actions
+  are not offered, because a snap cannot start the computer's other programs. Properties
+  shows File Minnow's own summary.
+- **Start at login** works as usual; snapd starts the app with your session.
+- The index is kept in `~/snap/file-minnow/common/.cache/file-minnow` and the settings in
+  `~/snap/file-minnow/current/.config/file-minnow`, separate from a package install.
+
 ## Starting automatically
 
 Choose one of these, or neither:
