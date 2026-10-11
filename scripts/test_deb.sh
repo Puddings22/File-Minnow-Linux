@@ -18,6 +18,8 @@ apt-get install -y --no-install-recommends "$base_package"
 test "$(stat -c '%a' /usr/bin/file-minnow)" = 755
 test -f /usr/share/applications/org.fileminnow.FileMinnow.desktop
 test -f /usr/share/icons/hicolor/scalable/apps/file-minnow.svg
+test -f /usr/share/nemo/actions/file-minnow-search-here.nemo_action
+test -f /usr/share/kio/servicemenus/file-minnow-search-here.desktop
 test -f /usr/share/doc/file-minnow/licenses/dependencies.json
 test ! -e /etc/systemd/user/default.target.wants/file-minnow.service
 test ! -e /root/.config/autostart/file-minnow.desktop

@@ -21,9 +21,18 @@ File Minnow is built for exactly that.
 - **Light on resources.** About 100 MB of memory for a 1.6-million-file index. It uses
   **0 % CPU when idle**, has no animations, and never polls in the background.
 - **Familiar search syntax.** `AND`, `|` (OR), `!` (NOT), wildcards, `ext:`, `size:`,
-  `dm:` (date modified), `path:`, `regex:`, and type filters like `pic:` and `doc:`.
-- **Native desktop app.** It follows your GTK theme, fonts and file icons. Columns are
-  sortable (name, path, size, date, type), and there is a type filter beside the search box.
+  `dm:` / `dc:` (date modified / created), `path:`, `regex:`, `dupe:`, `empty:`,
+  `wholeword:`, `parent:`, `child:`, `content:` and type filters like `pic:` and `doc:`.
+- **Accent- and case-insensitive.** Typing `stiinta` finds `Știință`, `ecole` finds `École`.
+- **Native desktop app.** It follows your GTK theme, fonts and file icons. Matches are
+  highlighted; columns (name, path, size, modified, type, created) sort and can be hidden;
+  folders show the total size of what is inside them; an optional preview pane shows
+  pictures and text files.
+- **Saved searches.** Bookmarks, search history with completion, your own filters in the
+  drop-down beside the search box, and export of results to CSV or text.
+- **Drives and shares.** Removable drives can be indexed when plugged in and stay
+  searchable (greyed) while unplugged. Network folders are recognised and rescanned on a
+  schedule. Adding a folder indexes only that folder.
 - **The right-click menu you expect.** Open, Open With, Open Containing Folder, Open in
   Terminal, Cut/Copy (paste straight into your file manager), Rename, Move to Trash and
   Properties. It also shows your file manager's custom actions (Nemo actions, Thunar
@@ -105,8 +114,14 @@ packaging, desktop integration, autostart and the optional background service.
 | `file:` / `folder:` | only files or only folders |
 | `path:projects/src` | match against the full path |
 | `case:README` | case-sensitive |
-| `size:>100mb`, `size:1kb..2mb` | file size |
-| `dm:today`, `dm:2026-10-07`, `dm:>2026-01-01` | date modified (local time) |
+| `size:>100mb`, `size:1kb..2mb` | file size; folders count the files inside them |
+| `dm:today`, `dm:2026-10-07`, `dm:>2026-01-01` | date modified (local time); `dc:` for date created |
+| `wholeword:report`, `ww:report` | whole words only |
+| `dupe:` | names that occur more than once |
+| `empty:` | empty folders |
+| `parent:/home/alex/Documents` | directly inside a folder (no subfolders) |
+| `child:README.md` | folders that contain an entry with that name |
+| `content:invoice total` | text inside files (slow: reads each candidate file, best combined with other terms) |
 | `regex:"^report.*\.pdf$"` | regular expression (Rust syntax) |
 
 More in the [user manual](docs/manual.md).
@@ -126,6 +141,9 @@ More in the [user manual](docs/manual.md).
 | F5 | Rescan |
 | Escape | Hide the window (to the tray) |
 
+In Nemo and Dolphin, right-click a folder → **Search Here with File Minnow** opens the
+window scoped to that folder (`file-minnow show --in FOLDER` from scripts).
+
 ## Everything vs. File Minnow: FAQ
 
 **Is there a version of Everything for Linux?**
@@ -139,8 +157,9 @@ File Minnow watches your folders and updates instantly. It also has a desktop UI
 sorting, a type filter and file actions.
 
 **Does it search inside files?**
-No. Like Everything, it searches file and folder **names** and paths, which is why it is
-so fast.
+Not by default: like Everything, it searches file and folder **names** and paths, which
+is why it is so fast. `content:text` additionally reads the candidate files (up to 16 MB
+each), so combine it with a name term or type filter to keep it quick.
 
 **Does it need root, or does it index the whole disk?**
 No root. It indexes only the folders you add, with your own permissions. Pseudo
@@ -160,10 +179,9 @@ See [docs/performance.md](docs/performance.md).
 
 ## Status
 
-File Minnow is young (0.x). It is used daily on Linux Mint Cinnamon. Not yet
-available: file-content search, recursive folder sizes, search history and bookmarks in
-the UI, and network-share indexing beyond what a mounted folder offers. Bug reports and
-pull requests are welcome.
+File Minnow is young (0.x). It is used daily on Linux Mint Cinnamon. Wayland window
+show/hide is not yet verified on every compositor, and there is no built-in web server
+for searching from another device. Bug reports and pull requests are welcome.
 
 ## Development
 

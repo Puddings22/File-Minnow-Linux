@@ -1,7 +1,7 @@
 use crate::{
-    config::{ConfigStore, IndexConfig, PatternRules, Settings},
+    config::{ConfigStore, IndexConfig, PatternRules, RootConfig, Settings},
     index::{self, Snapshot},
-    store,
+    mounts, store,
     watch::{Signal, Watcher},
 };
 use anyhow::{Context, Result};
@@ -35,6 +35,10 @@ pub struct Status {
     /// Folders currently monitored for changes.
     #[serde(default)]
     pub watched: usize,
+    /// Roots that keep their entries and are unavailable right now
+    /// (unplugged drives, unmounted shares).
+    #[serde(default)]
+    pub offline: Vec<String>,
     pub message: String,
 }
 pub struct State {
@@ -78,6 +82,8 @@ enum Command {
     Rescan(Option<PathBuf>),
     Pause(bool),
     Event(Vec<PathBuf>),
+    /// The mount table changed (a drive was plugged in or removed).
+    Mounts,
     Stop,
 }
 #[derive(Clone)]
@@ -189,6 +195,7 @@ impl Runtime {
             dir,
             state: state.clone(),
             settings: settings.clone(),
+            config: config.clone(),
             signals: signals.clone(),
             paused: paused.clone(),
             stop: stop.clone(),
@@ -288,6 +295,93 @@ fn release_memory() {
         libc::malloc_trim(0);
     }
 }
+/// Wakes the indexer when the mount table changes. `/proc/self/mountinfo`
+/// signals a change through poll, so the thread sleeps until then.
+fn watch_mounts(tx: mpsc::SyncSender<Command>, wake: thread::Thread, stop: Arc<AtomicBool>) {
+    use std::{io::Read, os::fd::AsRawFd};
+    let Ok(mut file) = std::fs::File::open("/proc/self/mountinfo") else {
+        return;
+    };
+    let _ = thread::Builder::new()
+        .name("file-minnow-mounts".into())
+        .spawn(move || {
+            let mut poll = libc::pollfd {
+                fd: file.as_raw_fd(),
+                events: libc::POLLPRI,
+                revents: 0,
+            };
+            let mut sink = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                // SAFETY: `poll` is one initialized pollfd.
+                let ready = unsafe { libc::poll(&mut poll, 1, 2000) };
+                if ready > 0 && poll.revents != 0 {
+                    // Reading re-arms the notification.
+                    use std::io::Seek;
+                    let _ = file.seek(std::io::SeekFrom::Start(0));
+                    sink.clear();
+                    let _ = file.read_to_end(&mut sink);
+                    if tx.try_send(Command::Mounts).is_ok() {
+                        wake.unpark();
+                    }
+                }
+            }
+        });
+}
+impl Worker {
+    /// Adds newly plugged removable drives as roots (when enabled) and
+    /// rescans roots that came back. Returns Some when the roots changed.
+    fn mounts_changed(
+        &self,
+        config: &mut IndexConfig,
+        changed: &mut BTreeSet<PathBuf>,
+    ) -> Option<()> {
+        let mounts = mounts::current();
+        let was_offline = self.state.read().unwrap().status.offline.clone();
+        for root in config.roots.iter().filter(|r| r.enabled && r.keep_offline) {
+            let path = root.path.path();
+            if was_offline.contains(&root.path.display()) && !index::is_offline(&path) {
+                changed.insert(path);
+            }
+        }
+        if !config.removable_drives {
+            return None;
+        }
+        let mut settings = self.settings.read().unwrap().clone();
+        let mut added = Vec::new();
+        for point in mounts::removable(&mounts) {
+            let covered = settings
+                .index
+                .roots
+                .iter()
+                .any(|r| point.starts_with(r.path.path()) || r.path.path().starts_with(&point));
+            if covered || index::excluded(&point, &self.dir) {
+                continue;
+            }
+            settings.index.roots.push(RootConfig {
+                keep_offline: true,
+                removable: true,
+                ..RootConfig::new(&point)
+            });
+            added.push(point);
+        }
+        if added.is_empty() || settings.validate().is_err() {
+            return None;
+        }
+        match self.config.save(settings.revision, settings) {
+            Ok(saved) => {
+                *self.settings.write().unwrap() = saved;
+                *config = self.settings.read().unwrap().index.clone();
+                changed.extend(added);
+                Some(())
+            }
+            Err(e) => {
+                self.state.write().unwrap().status.message =
+                    format!("Cannot add removable drive: {e}");
+                None
+            }
+        }
+    }
+}
 fn config_monitors(config: &IndexConfig) -> bool {
     config.roots.iter().any(|r| r.enabled && r.monitor)
 }
@@ -306,6 +400,7 @@ struct Worker {
     dir: PathBuf,
     state: Shared,
     settings: Arc<RwLock<Settings>>,
+    config: ConfigStore,
     signals: Arc<Signals>,
     paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -368,6 +463,8 @@ impl Worker {
                 "Native monitoring unavailable; periodic fallback scans are active".to_owned(),
             ];
         }
+        watch_mounts(self.tx.clone(), thread::current(), self.stop.clone());
+        state.write().unwrap().status.offline = index::offline_roots(&config);
         let mut sweep = 0_u32;
         let mut deadlines = BTreeMap::new();
         reset_deadlines(&config, &mut deadlines);
@@ -387,14 +484,44 @@ impl Worker {
                     Command::Stop => break 'run,
                     Command::Settings(next) => {
                         let index_changed = next.index != config;
+                        // Roots that were only added are scanned on their own;
+                        // any other change re-walks everything.
+                        let mut trimmed = next.index.clone();
+                        trimmed.roots.retain(|r| config.roots.contains(r));
+                        let added: Vec<PathBuf> = next
+                            .index
+                            .roots
+                            .iter()
+                            .filter(|r| r.enabled && !config.roots.contains(r))
+                            .map(|r| r.path.path())
+                            .collect();
+                        let only_added = trimmed == config && !added.is_empty();
                         *self.settings.write().unwrap() = *next;
                         if index_changed {
                             config = self.settings.read().unwrap().index.clone();
                             *event_policy.write().unwrap() = EventPolicy::new(&config)?;
                             reset_deadlines(&config, &mut deadlines);
-                            // The full scan re-watches folders and drops the rest.
-                            full = true;
+                            if only_added && !current.entries.is_empty() {
+                                changed.extend(added);
+                                dirty = Some(Instant::now() - Duration::from_secs(60));
+                            } else {
+                                // The full scan re-watches folders and drops the rest.
+                                full = true;
+                            }
+                            state.write().unwrap().status.offline = index::offline_roots(&config);
                         }
+                        signals.notify(state);
+                    }
+                    Command::Mounts => {
+                        let outcome = self.mounts_changed(&mut config, &mut changed);
+                        if outcome.is_some() {
+                            *event_policy.write().unwrap() = EventPolicy::new(&config)?;
+                            reset_deadlines(&config, &mut deadlines);
+                        }
+                        if !changed.is_empty() {
+                            dirty = Some(Instant::now() - Duration::from_secs(60));
+                        }
+                        state.write().unwrap().status.offline = index::offline_roots(&config);
                         signals.notify(state);
                     }
                     Command::Rescan(root) => match root {
@@ -499,6 +626,7 @@ impl Worker {
                         dir,
                         current.generation + 1,
                         None,
+                        Some(&current.entries),
                         &cancel,
                         &progress,
                         hook,
@@ -553,6 +681,7 @@ impl Worker {
                     s.status.last_scan = current.scanned_at;
                     s.status.errors = current.errors.clone();
                     s.status.error_count = current.error_count;
+                    s.status.offline = index::offline_roots(&config);
                     s.status.message = match persisted {
                         Ok(()) => if config.paths().is_empty() {
                             "Add a folder to start indexing"

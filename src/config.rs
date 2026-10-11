@@ -112,6 +112,11 @@ pub struct RootConfig {
     pub recursive: bool,
     pub monitor: bool,
     pub schedule: Schedule,
+    /// Keep the indexed entries while the folder is unavailable (an
+    /// unplugged drive or an unmounted share), instead of dropping them.
+    pub keep_offline: bool,
+    /// Added automatically because a removable drive was plugged in.
+    pub removable: bool,
 }
 impl Default for RootConfig {
     fn default() -> Self {
@@ -121,6 +126,8 @@ impl Default for RootConfig {
             recursive: true,
             monitor: true,
             schedule: Schedule::default(),
+            keep_offline: false,
+            removable: false,
         }
     }
 }
@@ -130,6 +137,16 @@ impl RootConfig {
             path: RawPath::new(path),
             ..Self::default()
         }
+    }
+    /// A root for a folder the user picked. Network folders get a 30-minute
+    /// rescan instead of the daily one: inotify only reports changes made
+    /// through this computer, not by others on the share.
+    pub fn for_folder(path: &Path) -> Self {
+        let mut root = Self::new(path);
+        if crate::mounts::network_fs(path).is_some() {
+            root.schedule = Schedule::Interval { seconds: 1800 };
+        }
+        root
     }
 }
 
@@ -145,6 +162,9 @@ pub struct IndexConfig {
     pub exclude_file_types: bool,
     /// Lower-case extensions without the dot (`tmp`, `tar.gz`).
     pub excluded_file_types: Vec<String>,
+    /// Index removable drives when they are plugged in (their entries are
+    /// kept while unplugged).
+    pub removable_drives: bool,
     pub event_debounce_ms: u64,
     pub fallback_rescan_seconds: u64,
 }
@@ -161,6 +181,7 @@ impl Default for IndexConfig {
                 .iter()
                 .map(|s| (*s).to_owned())
                 .collect(),
+            removable_drives: false,
             event_debounce_ms: 200,
             fallback_rescan_seconds: 1800,
         }
@@ -375,6 +396,15 @@ pub struct UiConfig {
     pub history_enabled: bool,
     pub history_days: u32,
     pub history_limit: usize,
+    /// User-defined type filters (Options → Filters), shown after the
+    /// built-in ones beside the search box.
+    pub filters: Vec<Filter>,
+}
+/// A named search that the filter drop-down adds to whatever is typed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Filter {
+    pub name: String,
+    pub query: String,
 }
 impl Default for UiConfig {
     fn default() -> Self {
@@ -390,6 +420,7 @@ impl Default for UiConfig {
             history_enabled: true,
             history_days: 90,
             history_limit: 200,
+            filters: Vec::new(),
         }
     }
 }
@@ -438,6 +469,18 @@ impl Settings {
         }
         if self.ui.history_limit > 10_000 || self.ui.history_days > 3650 {
             bail!("History limits are too large");
+        }
+        if self.ui.filters.len() > 200 {
+            bail!("At most 200 filters are allowed");
+        }
+        for filter in &self.ui.filters {
+            if filter.name.trim().is_empty() || filter.name.len() > 64 {
+                bail!("Filter needs a name of at most 64 bytes");
+            }
+            if filter.query.trim().is_empty() {
+                bail!("Filter “{}” needs a search", filter.name);
+            }
+            crate::query::Query::parse(&filter.query)?;
         }
         if self.bookmarks.len() > 1000 {
             bail!("At most 1000 bookmarks are allowed");

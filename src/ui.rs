@@ -5,6 +5,7 @@ use crate::{
     config::{self, Settings},
     desktop::{self, Emitter, Event, Instance, Integration, WindowAction, WindowState},
     file_ops,
+    history::History,
     index::{Entry, Kind},
     query::{SearchRequest, SearchResponse, Sort},
     settings_ui::OptionsWindow,
@@ -26,7 +27,7 @@ use std::{
 /// Window size, position, maximized state, column widths and sort order.
 /// Kept apart from the settings file: it changes often and must not race
 /// with an open Options dialog.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct WindowMemory {
     width: i32,
@@ -39,6 +40,33 @@ struct WindowMemory {
     descending: bool,
     /// The type filter's search macro (`pic:`...), empty for all.
     filter: String,
+    /// Columns switched off in the View menu (Name cannot be hidden).
+    #[serde(default = "default_hidden")]
+    hidden_columns: Vec<String>,
+    /// Preview pane shown, and its width.
+    preview: bool,
+    preview_width: i32,
+}
+fn default_hidden() -> Vec<String> {
+    vec!["Created".into()]
+}
+impl Default for WindowMemory {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            x: None,
+            y: None,
+            maximized: false,
+            columns: Vec::new(),
+            sort: None,
+            descending: false,
+            filter: String::new(),
+            hidden_columns: default_hidden(),
+            preview: false,
+            preview_width: 320,
+        }
+    }
 }
 impl WindowMemory {
     fn path(dir: &std::path::Path) -> PathBuf {
@@ -93,6 +121,113 @@ pub(crate) enum Message {
     Error(String),
     SuspendShortcut(bool),
     SaveWindow,
+    /// Run this search (a bookmark chosen from the menu).
+    RunSearch(String),
+    /// A preview loaded in the background, for request `id`.
+    Preview(u64, PreviewContent),
+    /// The selection settled: load the preview.
+    LoadPreview,
+}
+pub(crate) enum PreviewContent {
+    /// Decoded, already scaled pixels (RGB or RGBA, 8 bits per sample).
+    Image {
+        bytes: glib::Bytes,
+        width: i32,
+        height: i32,
+        stride: i32,
+        alpha: bool,
+    },
+    Text(String),
+    Info(String),
+}
+/// The preview pane: a header, then an image, a text view or a summary.
+pub(crate) struct PreviewPane {
+    frame: gtk::Box,
+    header: gtk::Label,
+    image: gtk::Image,
+    text: gtk::TextView,
+    text_scroll: gtk::ScrolledWindow,
+    info: gtk::Label,
+}
+impl PreviewPane {
+    fn new() -> Self {
+        let frame = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        frame.set_margin_start(6);
+        frame.set_margin_end(6);
+        frame.set_margin_top(6);
+        frame.set_margin_bottom(6);
+        frame.set_no_show_all(true);
+        let header = gtk::Label::new(None);
+        header.set_xalign(0.);
+        header.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        header.set_selectable(true);
+        header.show();
+        let image = gtk::Image::new();
+        let text = gtk::TextView::new();
+        text.set_editable(false);
+        text.set_cursor_visible(false);
+        text.set_monospace(true);
+        text.set_wrap_mode(gtk::WrapMode::None);
+        text.set_left_margin(4);
+        text.show();
+        let text_scroll =
+            gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+        text_scroll.set_shadow_type(gtk::ShadowType::In);
+        text_scroll.add(&text);
+        let info = gtk::Label::new(None);
+        info.set_xalign(0.);
+        info.set_yalign(0.);
+        info.set_line_wrap(true);
+        info.set_selectable(true);
+        frame.pack_start(&header, false, false, 0);
+        frame.pack_start(&image, true, true, 0);
+        frame.pack_start(&text_scroll, true, true, 0);
+        frame.pack_start(&info, true, true, 0);
+        Self {
+            frame,
+            header,
+            image,
+            text,
+            text_scroll,
+            info,
+        }
+    }
+    fn show_content(&self, content: PreviewContent) {
+        self.image.hide();
+        self.text_scroll.hide();
+        self.info.hide();
+        match content {
+            PreviewContent::Image {
+                bytes,
+                width,
+                height,
+                stride,
+                alpha,
+            } => {
+                let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_bytes(
+                    &bytes,
+                    gtk::gdk_pixbuf::Colorspace::Rgb,
+                    alpha,
+                    8,
+                    width,
+                    height,
+                    stride,
+                );
+                self.image.set_from_pixbuf(Some(&pixbuf));
+                self.image.show();
+            }
+            PreviewContent::Text(text) => {
+                if let Some(buffer) = self.text.buffer() {
+                    buffer.set_text(&text);
+                }
+                self.text_scroll.show();
+            }
+            PreviewContent::Info(text) => {
+                self.info.set_text(&text);
+                self.info.show();
+            }
+        }
+    }
 }
 pub(crate) struct App {
     _session: Session,
@@ -149,6 +284,27 @@ pub(crate) struct App {
     waiting_for_search: bool,
     /// The `hide_results_until_search` value the shown results follow.
     hide_until_search: bool,
+    /// Folded search terms of the shown results, for highlighting.
+    highlight: Rc<RefCell<Vec<Vec<u8>>>>,
+    /// Roots whose drive or share is unavailable; their rows are greyed.
+    offline: Rc<RefCell<Vec<Vec<u8>>>>,
+    /// Result columns in order (Name, Path, Size, Modified, Type, Created).
+    columns: Vec<gtk::TreeViewColumn>,
+    history: History,
+    /// Model behind the search box's completion: the history, newest first.
+    completion: gtk::ListStore,
+    bookmarks_menu: gtk::Menu,
+    /// The bookmarks and custom filters the menus/drop-down were built from.
+    shown_bookmarks: Vec<config::Bookmark>,
+    shown_filters: Vec<config::Filter>,
+    /// Set while the filter drop-down is rebuilt, so its change signal is ignored.
+    filter_rebuilding: Rc<Cell<bool>>,
+    paned: gtk::Paned,
+    preview: PreviewPane,
+    /// Debounce for loading the preview after the selection changes.
+    preview_timer: Option<glib::SourceId>,
+    /// Number of the latest preview request; older results are dropped.
+    preview_id: u64,
     /// The request whose results are displayed, and the one in flight; when
     /// they match, a refresh keeps the selection and scroll position.
     shown_key: Option<(String, Sort, bool, usize)>,
@@ -192,6 +348,65 @@ fn size(n: u64) -> String {
     } else {
         format!("{:.1} GB", n as f64 / 1073741824.)
     }
+}
+fn created(e: &Entry) -> String {
+    if e.created == crate::table::NO_DATE {
+        return String::new();
+    }
+    chrono::DateTime::from_timestamp(e.created, 0)
+        .map(|d| {
+            d.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+/// Pango markup for `text` with every occurrence of the (folded) search
+/// terms in bold. Positions are found in the folded text and mapped back.
+fn highlight_markup(text: &str, terms: &[Vec<u8>]) -> String {
+    let escaped = |s: &str| glib::markup_escape_text(s).to_string();
+    if terms.is_empty() {
+        return escaped(text);
+    }
+    let (folded, offsets) = crate::fold::fold_with_offsets(text);
+    let mut marks = vec![false; text.len()];
+    for term in terms {
+        if term.is_empty() {
+            continue;
+        }
+        for hit in memchr::memmem::find_iter(&folded, term) {
+            let (Some(&start), Some(&last)) = (offsets.get(hit), offsets.get(hit + term.len() - 1))
+            else {
+                continue;
+            };
+            let end = text[last..]
+                .char_indices()
+                .nth(1)
+                .map_or(text.len(), |(i, _)| last + i);
+            for m in &mut marks[start..end] {
+                *m = true;
+            }
+        }
+    }
+    if !marks.iter().any(|m| *m) {
+        return escaped(text);
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut from = 0;
+    let mut bold = false;
+    for (i, _) in text.char_indices() {
+        if marks[i] != bold {
+            out.push_str(&escaped(&text[from..i]));
+            out.push_str(if marks[i] { "<b>" } else { "</b>" });
+            bold = marks[i];
+            from = i;
+        }
+    }
+    out.push_str(&escaped(&text[from..]));
+    if bold {
+        out.push_str("</b>");
+    }
+    out
 }
 fn modified(e: &Entry) -> String {
     chrono::DateTime::from_timestamp(e.modified, 0)
@@ -266,15 +481,17 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
     entry.set_margin_top(4);
     entry.set_margin_bottom(4);
     entry.set_hexpand(true);
+    // Recent searches complete the search box (history, newest first).
+    let completion_store = gtk::ListStore::new(&[String::static_type()]);
+    let completion = gtk::EntryCompletion::new();
+    completion.set_model(Some(&completion_store));
+    completion.set_text_column(0);
+    completion.set_inline_completion(false);
+    completion.set_popup_completion(true);
+    completion.set_minimum_key_length(1);
+    entry.set_completion(Some(&completion));
     let filter = gtk::ComboBoxText::new();
-    filter.append(Some(""), "All");
-    for (label, macro_, _) in crate::query::TYPE_FILTERS.iter().take(3) {
-        filter.append(Some(macro_), label);
-    }
-    filter.append(Some("folder:"), "Folder");
-    for (label, macro_, _) in crate::query::TYPE_FILTERS.iter().skip(3) {
-        filter.append(Some(macro_), label);
-    }
+    fill_filters(&filter, &[]);
     filter.set_active_id(Some(""));
     filter.set_tooltip_text(Some("Show only one type of file"));
     filter.set_focus_on_click(false);
@@ -299,7 +516,12 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
     scroller.set_kinetic_scrolling(false);
     scroller.set_overlay_scrolling(false);
     scroller.add(&tree);
-    layout.pack_start(&scroller, true, true, 0);
+    // Results on the left, the optional preview pane on the right.
+    let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+    paned.pack1(&scroller, true, false);
+    let preview = PreviewPane::new();
+    paned.pack2(&preview.frame, false, true);
+    layout.pack_start(&paned, true, true, 0);
     let pager = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     pager.set_margin_start(6);
     pager.set_margin_end(6);
@@ -396,6 +618,21 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
         context_menu: None,
         waiting_for_search: false,
         hide_until_search: settings.ui.hide_results_until_search,
+        highlight: Rc::default(),
+        offline: Rc::default(),
+        columns: Vec::new(),
+        history: History::load(History::path_for(
+            &config::ConfigStore::for_data_dir(&dir).path,
+        )),
+        completion: completion_store.clone(),
+        bookmarks_menu: gtk::Menu::new(),
+        shown_bookmarks: Vec::new(),
+        shown_filters: Vec::new(),
+        filter_rebuilding: Rc::new(Cell::new(false)),
+        paned: paned.clone(),
+        preview,
+        preview_timer: None,
+        preview_id: 0,
         shown_key: None,
         requested_key: (String::new(), Sort::Name, false, 0),
     }));
@@ -411,7 +648,11 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
         })
     });
     let target = weak.clone();
+    let rebuilding = app.borrow().filter_rebuilding.clone();
     filter.connect_changed(move |_| {
+        if rebuilding.get() {
+            return;
+        }
         with_app(&target, |a| {
             a.offset = 0;
             a.remember();
@@ -533,6 +774,7 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
         a.window.show_all();
         a.pager.hide();
         a.entry.set_text(launch.query.as_deref().unwrap_or(""));
+        a.refresh_completion();
         a.focus_search();
         a.backend_changed();
         a.schedule();
@@ -578,7 +820,25 @@ fn restore_window(app: &AppRef) {
     if !memory.filter.is_empty() {
         a.filter.set_active_id(Some(&memory.filter));
     }
+    for column in &a.columns {
+        let title = column.title().unwrap_or_default();
+        column.set_visible(title == "Name" || !memory.hidden_columns.iter().any(|h| *h == title));
+    }
     a.memory = memory;
+    let preview = a.memory.preview;
+    a.set_preview(preview);
+    let weak = Rc::downgrade(app);
+    a.paned.connect_position_notify(move |paned| {
+        with_app(&weak, |a| {
+            if a.memory.preview && paned.is_mapped() {
+                let width = paned.allocated_width() - paned.position();
+                if width > 80 {
+                    a.memory.preview_width = width;
+                    a.remember();
+                }
+            }
+        });
+    });
     let weak = Rc::downgrade(app);
     a.window.connect_configure_event(move |window, _| {
         with_app(&weak, |a| {
@@ -639,16 +899,40 @@ fn type_name(cache: &RefCell<std::collections::HashMap<Vec<u8>, String>>, e: &En
         })
         .clone()
 }
+/// Whether `path` lies under one of the unavailable roots.
+fn is_offline(offline: &[Vec<u8>], path: &[u8]) -> bool {
+    offline.iter().any(|root| crate::table::within(path, root))
+}
+/// Fills the type filter drop-down: the built-in types, folders, then the
+/// user's own filters (whose id is their search).
+fn fill_filters(filter: &gtk::ComboBoxText, custom: &[config::Filter]) {
+    filter.remove_all();
+    filter.append(Some(""), "All");
+    for (label, macro_, _) in crate::query::TYPE_FILTERS.iter().take(3) {
+        filter.append(Some(macro_), label);
+    }
+    filter.append(Some("folder:"), "Folder");
+    for (label, macro_, _) in crate::query::TYPE_FILTERS.iter().skip(3) {
+        filter.append(Some(macro_), label);
+    }
+    for f in custom {
+        filter.append(Some(&f.query), &f.name);
+    }
+}
+/// Result columns: title, default width and sort key. Name is always shown.
+const COLUMNS: [(&str, i32, Sort); 6] = [
+    ("Name", 300, Sort::Name),
+    ("Path", 400, Sort::Path),
+    ("Size", 95, Sort::Size),
+    ("Modified", 155, Sort::Modified),
+    ("Type", 140, Sort::Type),
+    ("Created", 155, Sort::Created),
+];
 fn build_columns(app: &AppRef) {
-    let a = app.borrow();
+    let mut a = app.borrow_mut();
     let types: Rc<RefCell<std::collections::HashMap<Vec<u8>, String>>> = Rc::default();
-    for (number, title, width, sort) in [
-        (0, "Name", 300, Sort::Name),
-        (1, "Path", 400, Sort::Path),
-        (2, "Size", 95, Sort::Size),
-        (3, "Modified", 155, Sort::Modified),
-        (4, "Type", 140, Sort::Type),
-    ] {
+    let mut columns = Vec::new();
+    for (number, (title, width, sort)) in COLUMNS.into_iter().enumerate() {
         let column = gtk::TreeViewColumn::new();
         column.set_title(title);
         column.set_sizing(gtk::TreeViewColumnSizing::Fixed);
@@ -661,6 +945,7 @@ fn build_columns(app: &AppRef) {
             icon.set_property("stock-size", i32::from(gtk::IconSize::Menu) as u32);
             gtk::prelude::TreeViewColumnExt::pack_start(&column, &icon, false);
             let rows = a.data.clone();
+            let offline = a.offline.clone();
             gtk::prelude::TreeViewColumnExt::set_cell_data_func(
                 &column,
                 &icon,
@@ -672,6 +957,7 @@ fn build_columns(app: &AppRef) {
                     let Some(e) = rows.as_ref().and_then(|r| r.entries.get(i as usize)) else {
                         return;
                     };
+                    cell.set_property("sensitive", !is_offline(&offline.borrow(), &e.path));
                     let icon = cell.downcast_ref::<gtk::CellRendererPixbuf>().unwrap();
                     let gicon: gio::Icon = if e.kind == "folder" {
                         gio::ThemedIcon::new("folder").upcast()
@@ -696,6 +982,8 @@ fn build_columns(app: &AppRef) {
         gtk::prelude::TreeViewColumnExt::pack_start(&column, &text, true);
         let rows = a.data.clone();
         let types = types.clone();
+        let highlight = a.highlight.clone();
+        let offline = a.offline.clone();
         gtk::prelude::TreeViewColumnExt::set_cell_data_func(
             &column,
             &text,
@@ -707,27 +995,34 @@ fn build_columns(app: &AppRef) {
                 let Some(e) = rows.as_ref().and_then(|r| r.entries.get(i as usize)) else {
                     return;
                 };
+                // Entries of an unplugged drive are shown greyed.
+                cell.set_property("sensitive", !is_offline(&offline.borrow(), &e.path));
                 let value = match number {
-                    0 => e.display_name(),
+                    0 => {
+                        // Matches in bold; the Name column uses markup.
+                        let markup = highlight_markup(&e.display_name(), &highlight.borrow());
+                        cell.set_property("markup", markup);
+                        return;
+                    }
                     1 => e
                         .path_buf()
                         .parent()
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default(),
-                    2 => {
-                        if e.kind == "folder" {
-                            String::new()
-                        } else {
-                            size(e.size)
-                        }
-                    }
+                    // Folders show the total size of the files inside them.
+                    2 => match e.kind {
+                        Kind::File | Kind::Folder => size(e.size),
+                        _ => String::new(),
+                    },
                     3 => modified(e),
-                    _ => type_name(&types, e),
+                    4 => type_name(&types, e),
+                    _ => created(e),
                 };
                 cell.set_property("text", value);
             })),
         );
         a.tree.append_column(&column);
+        columns.push(column.clone());
         let weak = Rc::downgrade(app);
         column.connect_clicked(move |_| {
             with_app(&weak, |a| {
@@ -744,6 +1039,7 @@ fn build_columns(app: &AppRef) {
             })
         });
     }
+    a.columns = columns;
 }
 /// Gives `window` the keyboard focus through the window manager on X11.
 /// Without a user timestamp, `gtk::Window::present` alone is refused by
@@ -776,13 +1072,56 @@ fn item(menu: &gtk::Menu, label: &str, action: impl Fn() + 'static) {
     menu.append(&item);
 }
 fn build_menus(app: &AppRef, bar: &gtk::MenuBar) {
-    for name in ["_File", "_Edit", "_Search", "_Tools", "_Help"] {
+    for name in [
+        "_File",
+        "_Edit",
+        "_View",
+        "_Search",
+        "_Bookmarks",
+        "_Tools",
+        "_Help",
+    ] {
         let root = gtk::MenuItem::with_mnemonic(name);
         let menu = gtk::Menu::new();
         root.set_submenu(Some(&menu));
         bar.append(&root);
         let w = Rc::downgrade(app);
         match name {
+            "_View" => {
+                // Built before the saved window state is applied: read it directly.
+                let (columns, hidden) = {
+                    let a = app.borrow();
+                    (
+                        a.columns.clone(),
+                        WindowMemory::load(&a.memory_path).hidden_columns,
+                    )
+                };
+                for column in columns.into_iter().skip(1) {
+                    let title = column.title().unwrap_or_default().to_string();
+                    let check = gtk::CheckMenuItem::with_label(&title);
+                    check.set_active(!hidden.contains(&title));
+                    let t = w.clone();
+                    check.connect_toggled(move |c| {
+                        column.set_visible(c.is_active());
+                        with_app(&t, |a| {
+                            a.memory.hidden_columns.retain(|h| *h != title);
+                            if !c.is_active() {
+                                a.memory.hidden_columns.push(title.clone());
+                            }
+                            a.remember();
+                        });
+                    });
+                    menu.append(&check);
+                }
+                menu.append(&gtk::SeparatorMenuItem::new());
+                let preview = gtk::CheckMenuItem::with_mnemonic("_Preview Pane");
+                preview.set_active(WindowMemory::load(&app.borrow().memory_path).preview);
+                let t = w.clone();
+                preview.connect_toggled(move |c| {
+                    with_app(&t, |a| a.set_preview(c.is_active()));
+                });
+                menu.append(&preview);
+            }
             "_File" => {
                 let t = w.clone();
                 item(&menu, "_Add Folder…", move || {
@@ -798,7 +1137,34 @@ fn build_menus(app: &AppRef, bar: &gtk::MenuBar) {
                 item(&menu, "Open Containing _Folder", move || {
                     with_app(&t, |a| a.open_selected(true))
                 });
+                menu.append(&gtk::SeparatorMenuItem::new());
+                let t = w.clone();
+                item(&menu, "_Export Results…", move || {
+                    if let Some(a) = t.upgrade() {
+                        App::export(&a);
+                    }
+                });
+                menu.append(&gtk::SeparatorMenuItem::new());
                 item(&menu, "_Quit", move || with_app(&w, App::quit));
+            }
+            "_Bookmarks" => {
+                let t = w.clone();
+                item(&menu, "_Add Bookmark…", move || {
+                    if let Some(a) = t.upgrade() {
+                        App::add_bookmark(&a);
+                    }
+                });
+                let t = w.clone();
+                item(&menu, "_Organize Bookmarks…", move || {
+                    if let Some(a) = t.upgrade() {
+                        App::options(&a);
+                        if let Some(options) = &a.borrow().options {
+                            options.select_tab("Bookmarks");
+                        }
+                    }
+                });
+                menu.append(&gtk::SeparatorMenuItem::new());
+                app.borrow_mut().bookmarks_menu = menu.clone();
             }
             "_Edit" => {
                 let t = w.clone();
@@ -818,12 +1184,56 @@ fn build_menus(app: &AppRef, bar: &gtk::MenuBar) {
                 item(&menu, "_Focus Search", move || {
                     with_app(&t, App::focus_search)
                 });
+                let t = w.clone();
                 item(&menu, "_Clear Search", move || {
-                    with_app(&w, |a| {
+                    with_app(&t, |a| {
                         a.entry.set_text("");
                         a.offset = 0;
                         a.schedule();
                         a.focus_search();
+                    })
+                });
+                menu.append(&gtk::SeparatorMenuItem::new());
+                // Recent searches are listed when the menu opens.
+                let recent = gtk::MenuItem::with_mnemonic("_Recent Searches");
+                let submenu = gtk::Menu::new();
+                recent.set_submenu(Some(&submenu));
+                menu.append(&recent);
+                let t = w.clone();
+                menu.connect_show(move |_| {
+                    for child in submenu.children() {
+                        submenu.remove(&child);
+                    }
+                    let Some(app) = t.upgrade() else {
+                        return;
+                    };
+                    let items: Vec<String> = app
+                        .borrow()
+                        .history
+                        .items()
+                        .iter()
+                        .take(25)
+                        .map(|i| i.query.clone())
+                        .collect();
+                    if items.is_empty() {
+                        let none = gtk::MenuItem::with_label("No recent searches");
+                        none.set_sensitive(false);
+                        submenu.append(&none);
+                    }
+                    for query in items {
+                        let label = gtk::MenuItem::with_label(&query);
+                        let t = t.clone();
+                        label.connect_activate(move |_| {
+                            with_app(&t, |a| a.set_search(&query));
+                        });
+                        submenu.append(&label);
+                    }
+                    submenu.show_all();
+                });
+                item(&menu, "Clear Search _History", move || {
+                    with_app(&w, |a| {
+                        a.history.clear();
+                        a.refresh_completion();
                     })
                 });
             }
@@ -868,8 +1278,12 @@ fn connect_results(app: &AppRef) {
     let w = Rc::downgrade(app);
     tree.connect_row_activated(move |_, _, _| with_app(&w, |a| a.open_selected(false)));
     let w = Rc::downgrade(app);
-    tree.selection()
-        .connect_changed(move |_| with_app(&w, App::publish));
+    tree.selection().connect_changed(move |_| {
+        with_app(&w, |a| {
+            a.publish();
+            a.schedule_preview();
+        })
+    });
     let w = Rc::downgrade(app);
     tree.connect_key_press_event(move |_, e| {
         use gdk::keys::constants as key;
@@ -1154,6 +1568,271 @@ impl App {
         self.entry.grab_focus();
         self.entry.select_region(0, -1);
     }
+    fn set_preview(&mut self, on: bool) {
+        self.memory.preview = on;
+        if on {
+            self.preview.frame.show();
+            let total = self.paned.allocated_width();
+            if total > 0 {
+                self.paned
+                    .set_position((total - self.memory.preview_width.max(160)).max(200));
+            }
+            self.schedule_preview();
+        } else {
+            self.preview.frame.hide();
+        }
+        self.remember();
+    }
+    /// Loads the preview shortly after the selection settles.
+    fn schedule_preview(&mut self) {
+        if let Some(timer) = self.preview_timer.take() {
+            timer.remove();
+        }
+        if !self.memory.preview {
+            return;
+        }
+        let messages = self.messages.clone();
+        self.preview_timer = Some(glib::timeout_add_local_once(
+            Duration::from_millis(120),
+            move || {
+                let _ = messages.try_send(Message::LoadPreview);
+            },
+        ));
+    }
+    fn load_preview(&mut self) {
+        self.preview_timer = None;
+        if !self.memory.preview {
+            return;
+        }
+        self.preview_id += 1;
+        let id = self.preview_id;
+        let selected = self.selected();
+        let Some(entry) = selected.first().cloned() else {
+            self.preview.header.set_text("");
+            self.preview
+                .show_content(PreviewContent::Info(String::new()));
+            return;
+        };
+        self.preview.header.set_markup(&format!(
+            "<b>{}</b>",
+            glib::markup_escape_text(&entry.display_name())
+        ));
+        if selected.len() > 1 {
+            self.preview.show_content(PreviewContent::Info(format!(
+                "{} items selected",
+                count(selected.len())
+            )));
+            return;
+        }
+        let max_width = (self.preview.frame.allocated_width() - 12).max(160);
+        let max_height = (self.preview.frame.allocated_height() - 60).max(160);
+        let summary = format!(
+            "Location: {}\nType: {}\nSize: {}\nModified: {}\nCreated: {}",
+            entry.display_path(),
+            entry.kind.as_str(),
+            size(entry.size),
+            modified(&entry),
+            created(&entry)
+        );
+        let messages = self.messages.clone();
+        std::thread::spawn(move || {
+            let content = preview_content(&entry, max_width, max_height)
+                .unwrap_or(PreviewContent::Info(summary));
+            let _ = messages.send_blocking(Message::Preview(id, content));
+        });
+    }
+    /// Runs `query` as if typed.
+    fn set_search(&mut self, query: &str) {
+        self.entry.set_text(query);
+        self.offset = 0;
+        self.schedule();
+        self.focus_search();
+        self.entry.set_position(-1);
+    }
+    /// Remembers the current search (when the user acts on it: opens a
+    /// result, hides the window...).
+    fn record_history(&mut self) {
+        let ui = self.backend.settings().ui;
+        let text = self.entry.text();
+        if ui.history_enabled
+            && self
+                .history
+                .record(&text, ui.history_days, ui.history_limit)
+        {
+            self.refresh_completion();
+        }
+    }
+    fn refresh_completion(&mut self) {
+        self.completion.clear();
+        for item in self.history.items() {
+            self.completion
+                .insert_with_values(None, &[(0, &item.query)]);
+        }
+    }
+    /// Rebuilds the Bookmarks menu and the filter drop-down when their
+    /// settings changed (Options, CLI or another instance).
+    fn sync_saved_searches(&mut self, settings: &Settings) {
+        if settings.bookmarks != self.shown_bookmarks {
+            let children = self.bookmarks_menu.children();
+            // Keep Add, Organize and the separator; replace the rest.
+            for child in children.iter().skip(3) {
+                self.bookmarks_menu.remove(child);
+            }
+            if settings.bookmarks.is_empty() {
+                let none = gtk::MenuItem::with_label("No bookmarks yet");
+                none.set_sensitive(false);
+                self.bookmarks_menu.append(&none);
+            }
+            for bookmark in &settings.bookmarks {
+                let item = gtk::MenuItem::with_label(&bookmark.name);
+                item.set_tooltip_text(Some(&bookmark.query));
+                let query = bookmark.query.clone();
+                let messages = self.messages.clone();
+                item.connect_activate(move |_| {
+                    let _ = messages.try_send(Message::RunSearch(query.clone()));
+                });
+                self.bookmarks_menu.append(&item);
+            }
+            self.bookmarks_menu.show_all();
+            self.shown_bookmarks = settings.bookmarks.clone();
+        }
+        if settings.ui.filters != self.shown_filters {
+            let active = self.filter.active_id().map(|id| id.to_string());
+            self.filter_rebuilding.set(true);
+            fill_filters(&self.filter, &settings.ui.filters);
+            if !self.filter.set_active_id(active.as_deref()) {
+                self.filter.set_active_id(Some(""));
+            }
+            self.filter_rebuilding.set(false);
+            self.shown_filters = settings.ui.filters.clone();
+        }
+    }
+    /// Saves the current search as a bookmark.
+    fn add_bookmark(app: &AppRef) {
+        let (window, query) = {
+            let a = app.borrow();
+            (a.window.clone(), a.entry.text().to_string())
+        };
+        let dialog = gtk::Dialog::with_buttons(
+            Some("Add Bookmark"),
+            Some(&window),
+            gtk::DialogFlags::MODAL | gtk::DialogFlags::DESTROY_WITH_PARENT,
+            &[
+                ("Cancel", gtk::ResponseType::Cancel),
+                ("Add", gtk::ResponseType::Ok),
+            ],
+        );
+        dialog.set_default_response(gtk::ResponseType::Ok);
+        dialog.set_default_width(440);
+        let grid = gtk::Grid::new();
+        grid.set_column_spacing(8);
+        grid.set_row_spacing(6);
+        grid.set_margin_start(12);
+        grid.set_margin_end(12);
+        grid.set_margin_top(12);
+        let name = gtk::Entry::new();
+        name.set_text(&query);
+        name.set_activates_default(true);
+        let search = gtk::Entry::new();
+        search.set_text(&query);
+        search.set_activates_default(true);
+        for (row, label, entry) in [(0, "Name:", &name), (1, "Search:", &search)] {
+            let caption = gtk::Label::new(Some(label));
+            caption.set_xalign(0.);
+            grid.attach(&caption, 0, row, 1, 1);
+            entry.set_hexpand(true);
+            grid.attach(entry, 1, row, 1, 1);
+        }
+        let error = gtk::Label::new(None);
+        error.set_xalign(0.);
+        error.set_line_wrap(true);
+        grid.attach(&error, 0, 2, 2, 1);
+        dialog.content_area().pack_start(&grid, false, false, 0);
+        dialog.show_all();
+        name.grab_focus();
+        name.select_region(0, -1);
+        let weak = Rc::downgrade(app);
+        dialog.connect_response(move |dialog, response| {
+            if response != gtk::ResponseType::Ok {
+                dialog.close();
+                return;
+            }
+            let bookmark = config::Bookmark {
+                name: name.text().trim().to_owned(),
+                query: search.text().trim().to_owned(),
+            };
+            let mut outcome = Ok(());
+            with_app(&weak, |a| {
+                let mut settings = a.backend.settings();
+                settings.bookmarks.push(bookmark.clone());
+                outcome = settings.validate();
+                if outcome.is_ok() {
+                    a.apply_settings(settings, false);
+                }
+            });
+            match outcome {
+                Ok(()) => dialog.close(),
+                Err(e) => error.set_text(&e.to_string()),
+            }
+        });
+    }
+    /// Writes every result of the current search to a CSV or text file.
+    fn export(app: &AppRef) {
+        let (window, query, sort, descending, backend, messages) = {
+            let a = app.borrow();
+            (
+                a.window.clone(),
+                a.requested_key.0.clone(),
+                a.sort,
+                a.descending,
+                a.backend.clone(),
+                a.messages.clone(),
+            )
+        };
+        let dialog = gtk::FileChooserDialog::with_buttons(
+            Some("Export Results"),
+            Some(&window),
+            gtk::FileChooserAction::Save,
+            &[
+                ("Cancel", gtk::ResponseType::Cancel),
+                ("Export", gtk::ResponseType::Accept),
+            ],
+        );
+        dialog.set_modal(true);
+        dialog.set_do_overwrite_confirmation(true);
+        dialog.set_current_name("file-minnow-results.csv");
+        for (name, pattern) in [
+            ("CSV (name, path, size, dates, type)", "*.csv"),
+            ("Text, one full path per line", "*.txt"),
+        ] {
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some(name));
+            filter.add_pattern(pattern);
+            dialog.add_filter(filter);
+        }
+        dialog.connect_response(move |dialog, response| {
+            if response == gtk::ResponseType::Accept
+                && let Some(path) = dialog.filename()
+            {
+                let as_text = path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("txt"));
+                let query = query.clone();
+                let backend = backend.clone();
+                let messages = messages.clone();
+                std::thread::spawn(move || {
+                    let report =
+                        match export_results(&backend, &query, sort, descending, &path, as_text) {
+                            Ok(n) => format!("Exported {} results to {}", count(n), path.display()),
+                            Err(e) => format!("Export failed: {e}"),
+                        };
+                    let _ = messages.send_blocking(Message::Error(report));
+                });
+            }
+            dialog.close();
+        });
+        dialog.show_all();
+    }
     fn show(&mut self) {
         let mapped = self.window.is_mapped();
         self.activate_on_map.set(!mapped);
@@ -1206,6 +1885,7 @@ impl App {
             if let Some(options) = &self.options {
                 options.dialog.hide();
             }
+            self.record_history();
             // Where the window is now is where it comes back (`show`).
             if self.window.is_visible() && !self.memory.maximized {
                 let (x, y) = self.window.position();
@@ -1230,6 +1910,7 @@ impl App {
             Sort::Size => "Size",
             Sort::Modified => "Modified",
             Sort::Type => "Type",
+            Sort::Created => "Created",
         };
         for c in self.tree.columns() {
             c.set_sort_indicator(c.title().as_deref() == Some(title));
@@ -1268,6 +1949,7 @@ impl App {
         }
     }
     fn quit(&mut self) {
+        self.record_history();
         self.save_memory();
         self.quitting = true;
         self.window.hide();
@@ -1370,6 +2052,16 @@ impl App {
         }
         self.integration.configure(&desktop);
         self.integration.set_paused(status.paused);
+        self.sync_saved_searches(&settings);
+        let offline: Vec<Vec<u8>> = status
+            .offline
+            .iter()
+            .map(|r| r.as_bytes().to_vec())
+            .collect();
+        if *self.offline.borrow() != offline {
+            *self.offline.borrow_mut() = offline;
+            self.tree.queue_draw();
+        }
         if status.generation != self.last_generation
             || settings.ui.hide_results_until_search != self.hide_until_search
         {
@@ -1456,6 +2148,9 @@ impl App {
         };
         let scroll = self.scroller.vadjustment().value();
         self.shown_key = Some(self.requested_key.clone());
+        *self.highlight.borrow_mut() = crate::query::Query::parse(&self.requested_key.0)
+            .map(|q| q.highlight_terms())
+            .unwrap_or_default();
         // The GTK model stores only row IDs. Text and icons are requested for
         // visible rows, avoiding thousands of duplicated path strings.
         let model = gtk::ListStore::new(&[u32::static_type()]);
@@ -1654,6 +2349,16 @@ impl App {
                 a.status.set_text(&error);
                 a.publish();
             }
+            Message::RunSearch(query) => {
+                app.borrow_mut().set_search(&query);
+            }
+            Message::LoadPreview => app.borrow_mut().load_preview(),
+            Message::Preview(id, content) => {
+                let a = app.borrow();
+                if id == a.preview_id && a.memory.preview {
+                    a.preview.show_content(content);
+                }
+            }
             Message::SaveWindow => {
                 let mut a = app.borrow_mut();
                 // The one-shot timer has fired and is gone; just forget it.
@@ -1757,7 +2462,10 @@ impl App {
                     let mut settings = a.backend.settings();
                     for path in paths {
                         if !settings.index.roots.iter().any(|r| r.path.path() == path) {
-                            settings.index.roots.push(config::RootConfig::new(&path));
+                            settings
+                                .index
+                                .roots
+                                .push(config::RootConfig::for_folder(&path));
                         }
                     }
                     match settings.validate() {
@@ -1790,6 +2498,7 @@ impl App {
             .collect()
     }
     fn open_selected(&mut self, parent: bool) {
+        self.record_history();
         let paths = self.selected_paths();
         if paths.len() > 20 {
             self.info(
@@ -2041,6 +2750,125 @@ impl App {
     fn info(&self, title: &str, text: &str) {
         info(&self.window, title, text);
     }
+}
+/// Decodes an image (scaled to fit) or reads the start of a text file, off
+/// the main thread. None means "show the summary instead".
+fn preview_content(entry: &Entry, max_width: i32, max_height: i32) -> Option<PreviewContent> {
+    const TEXT_BYTES: usize = 64 * 1024;
+    const IMAGE_BYTES: u64 = 80 << 20;
+    if entry.kind != Kind::File {
+        return None;
+    }
+    let path = entry.path_buf();
+    let (kind, _) = file_ops::guess_type(&path);
+    if kind.starts_with("image/") && entry.size <= IMAGE_BYTES {
+        let pixbuf =
+            gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(&path, max_width, max_height, true)
+                .ok()?
+                .apply_embedded_orientation()?;
+        if pixbuf.bits_per_sample() != 8 || pixbuf.colorspace() != gtk::gdk_pixbuf::Colorspace::Rgb
+        {
+            return None;
+        }
+        return Some(PreviewContent::Image {
+            bytes: pixbuf.read_pixel_bytes(),
+            width: pixbuf.width(),
+            height: pixbuf.height(),
+            stride: pixbuf.rowstride(),
+            alpha: pixbuf.has_alpha(),
+        });
+    }
+    if gio::content_type_is_a(&kind, "text/plain") || kind == "application/json" {
+        use std::io::Read;
+        let mut file = std::fs::File::open(&path).ok()?;
+        let mut bytes = Vec::with_capacity(TEXT_BYTES.min(entry.size as usize + 1));
+        file.by_ref()
+            .take(TEXT_BYTES as u64)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.iter().take(4096).any(|b| *b == 0) {
+            return None;
+        }
+        let mut text = String::from_utf8_lossy(&bytes).into_owned();
+        if entry.size as usize > TEXT_BYTES {
+            text.push_str("\n…");
+        }
+        return Some(PreviewContent::Text(text));
+    }
+    None
+}
+/// Fetches all results page by page and writes them; returns the count.
+fn export_results(
+    backend: &Backend,
+    query: &str,
+    sort: Sort,
+    descending: bool,
+    path: &std::path::Path,
+    as_text: bool,
+) -> Result<usize> {
+    use std::io::Write;
+    let file = std::fs::File::create(path)?;
+    let mut out = std::io::BufWriter::new(file);
+    if !as_text {
+        writeln!(out, "Name,Path,Size,Modified,Created,Type")?;
+    }
+    let csv = |field: &str| -> String {
+        if field.contains([',', '"', '\n', '\r']) {
+            format!("\"{}\"", field.replace('"', "\"\""))
+        } else {
+            field.to_owned()
+        }
+    };
+    let mut written = 0;
+    let mut offset = 0;
+    loop {
+        let page = backend.search(
+            &SearchRequest {
+                query: query.into(),
+                sort,
+                descending,
+                limit: 10_000,
+                offset,
+            },
+            None,
+        )?;
+        if page.entries.is_empty() {
+            break;
+        }
+        for e in &page.entries {
+            if as_text {
+                out.write_all(&e.path)?;
+                out.write_all(b"\n")?;
+            } else {
+                let parent = e
+                    .path_buf()
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let size = match e.kind {
+                    Kind::File | Kind::Folder => e.size.to_string(),
+                    _ => String::new(),
+                };
+                writeln!(
+                    out,
+                    "{},{},{},{},{},{}",
+                    csv(&e.display_name()),
+                    csv(&parent),
+                    size,
+                    modified(e),
+                    created(e),
+                    e.kind.as_str()
+                )?;
+            }
+            written += 1;
+        }
+        offset += page.entries.len();
+        if offset >= page.total {
+            break;
+        }
+    }
+    out.flush()?;
+    Ok(written)
 }
 /// Opens entries (or their folders) with the desktop's default applications.
 fn open_paths(paths: Vec<PathBuf>, parent: bool, tx: async_channel::Sender<Message>) {

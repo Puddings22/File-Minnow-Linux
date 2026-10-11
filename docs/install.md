@@ -91,6 +91,15 @@ Choose one of these, or neither:
 Enabling both is only useful if you want the index to keep running after the window
 quits.
 
+## File manager integration
+
+The package installs a **Search Here with File Minnow** entry for folders in Nemo
+(`/usr/share/nemo/actions`) and Dolphin (`/usr/share/kio/servicemenus`). For a per-user
+install, copy `packaging/file-minnow-search-here.nemo_action` to
+`~/.local/share/nemo/actions/` or `packaging/file-minnow-search-here.desktop` to
+`~/.local/share/kio/servicemenus/` (and make it executable). Thunar users can add a custom
+action running `file-minnow show --in %f` for directories.
+
 ## Desktop compatibility
 
 - **Global shortcut.** On X11 File Minnow registers the shortcut directly. On Wayland it uses

@@ -166,6 +166,144 @@ fn deterministic_pagination_and_cancellation() {
     assert!(query::search(&s, &req, Some((&AtomicU64::new(2), 1))).is_err());
 }
 #[test]
+fn everything_style_functions_and_folding() {
+    let entry = |path: &str, kind, size, created| {
+        Entry::new(path.as_bytes().to_vec(), kind, size, 1_700_000_000).created(created)
+    };
+    let (f, d) = (index::Kind::File, index::Kind::Folder);
+    let none = file_minnow::table::NO_DATE;
+    let s = index::Snapshot {
+        entries: file_minnow::table::Table::from_entries(vec![
+            entry("/home", d, 0, none),
+            entry("/home/Documente", d, 0, none),
+            entry("/home/Documente/Știință.pdf", f, 3000, 1_600_000_000),
+            entry("/home/Documente/raport.pdf", f, 500, 1_650_000_000),
+            entry("/home/Documente/Rapoarte", d, 0, none),
+            entry("/home/Documente/Rapoarte/raport.pdf", f, 700, 1_700_000_000),
+            entry("/home/Documente/gol", d, 0, none),
+            entry("/home/Poze", d, 0, none),
+            entry("/home/Poze/École.jpg", f, 90_000, none),
+            entry("/home/Poze/report-final.txt", f, 10, none),
+            entry("/home/report.txt", f, 1, none),
+        ]),
+        ..Default::default()
+    };
+    let names = |query: &str, sort: Sort, descending: bool| -> Vec<String> {
+        let request = SearchRequest {
+            query: query.into(),
+            sort,
+            descending,
+            ..Default::default()
+        };
+        query::search(&s, &request, None)
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| String::from_utf8_lossy(e.name()).into_owned())
+            .collect()
+    };
+    // Accents and case are ignored both ways.
+    assert_eq!(names("stiinta", Sort::Name, false), ["Știință.pdf"]);
+    assert_eq!(names("ȘTIINȚĂ", Sort::Name, false), ["Știință.pdf"]);
+    assert_eq!(names("ecole", Sort::Name, false), ["École.jpg"]);
+    assert_eq!(names("path:poze ecole", Sort::Name, false), ["École.jpg"]);
+    assert!(names("case:stiinta", Sort::Name, false).is_empty());
+    // Duplicates, empty folders, parent and child.
+    assert_eq!(
+        names("dupe:", Sort::Path, false),
+        ["raport.pdf", "raport.pdf"]
+    );
+    assert_eq!(names("empty:", Sort::Name, false), ["gol"]);
+    assert_eq!(
+        names("parent:/home/Documente/", Sort::Name, false),
+        ["Rapoarte", "gol", "raport.pdf", "Știință.pdf"]
+    );
+    assert_eq!(
+        names("child:raport.pdf", Sort::Name, false),
+        ["Documente", "Rapoarte"]
+    );
+    assert_eq!(names("child:RAPOARTE", Sort::Name, false), ["Documente"]);
+    // Whole words: "report" but not "report-final"? A dash is a boundary, so
+    // both match; "repor" matches nothing as a whole word.
+    assert_eq!(
+        names("ww:report", Sort::Name, false),
+        ["report-final.txt", "report.txt"]
+    );
+    assert!(names("ww:repor", Sort::Name, false).is_empty());
+    assert_eq!(names("wholeword:gol", Sort::Name, false), ["gol"]);
+    // Folder sizes come from the files inside; size: applies to folders too.
+    assert_eq!(
+        names("folder: size:>=3500", Sort::Size, true),
+        ["home", "Poze", "Documente"]
+    );
+    let documents = query::search(
+        &s,
+        &SearchRequest {
+            query: "path:/home/Documente folder:".into(),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    let size_of = |name: &str| {
+        documents
+            .entries
+            .iter()
+            .find(|e| e.name() == name.as_bytes())
+            .unwrap()
+            .size
+    };
+    assert_eq!(
+        (size_of("Documente"), size_of("Rapoarte"), size_of("gol")),
+        (4200, 700, 0)
+    );
+    // Creation dates: unknown ones never match and sort first ascending.
+    assert_eq!(
+        names("dc:<2023-01-01", Sort::Created, false),
+        ["Știință.pdf", "raport.pdf"]
+    );
+    assert_eq!(
+        names("dc:>=2000-01-01", Sort::Created, true)[0],
+        "raport.pdf"
+    );
+    assert_eq!(names("dc:>=2000-01-01", Sort::Created, true).len(), 3);
+}
+#[test]
+fn content_search_reads_only_candidate_files() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("notes.txt"), "The Quarterly Report is late").unwrap();
+    fs::write(dir.join("other.txt"), "nothing here").unwrap();
+    fs::write(dir.join("report.md"), "no keyword").unwrap();
+    // The cache directory is never indexed, so it lives beside the files.
+    let s = index::scan(std::slice::from_ref(&dir), &t.path().join("cache"), 1);
+    assert_eq!(s.entries.len(), 4, "folder and three files");
+    let names = |query: &str| -> Vec<String> {
+        let request = SearchRequest {
+            query: query.into(),
+            ..Default::default()
+        };
+        query::search(&s, &request, None)
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| String::from_utf8_lossy(e.name()).into_owned())
+            .collect()
+    };
+    assert_eq!(names("content:quarterly"), ["notes.txt"]);
+    assert!(names("case:content:quarterly").is_empty());
+    assert_eq!(names("ext:txt content:report"), ["notes.txt"]);
+    assert!(names("report content:keyword !md").is_empty());
+    // OR binds tighter: report AND (content:keyword OR notes).
+    assert_eq!(names("report content:keyword | notes"), ["report.md"]);
+    assert_eq!(
+        names("<report content:keyword> | notes"),
+        ["notes.txt", "report.md"]
+    );
+    assert!(Query::parse("content:").is_err());
+}
+#[test]
 fn type_sort_and_type_filters() {
     let entry = |path: &str, kind| Entry::new(path.as_bytes().to_vec(), kind, 1, 1);
     let s = index::Snapshot {

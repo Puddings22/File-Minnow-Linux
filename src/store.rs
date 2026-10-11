@@ -64,7 +64,9 @@ pub fn writer_lock(dir: &Path) -> Result<File> {
     Ok(file)
 }
 const INDEX: &str = "index.bin";
-const MAGIC: &[u8; 8] = b"FMNIDX02";
+const MAGIC: &[u8; 8] = b"FMNIDX03";
+/// Earlier layouts of the same file; only a cache, so they are rebuilt.
+const OLD_MAGICS: [&[u8; 8]; 1] = [b"FMNIDX02"];
 /// Files from older versions. They are only a cache, so they are deleted.
 const LEGACY: [&str; 4] = [
     "index.sqlite",
@@ -170,7 +172,7 @@ impl<R: Read> Reader<R> {
     }
 }
 
-const ROW_BYTES: usize = 27;
+const ROW_BYTES: usize = 35;
 fn kind_byte(kind: Kind) -> u8 {
     match kind {
         Kind::File => 0,
@@ -214,6 +216,7 @@ pub fn save(dir: &Path, snapshot: &Snapshot) -> Result<()> {
             record[20..24].copy_from_slice(&row.dir.to_le_bytes());
             record[24..26].copy_from_slice(&len.to_le_bytes());
             record[26] = kind_byte(row.kind);
+            record[27..35].copy_from_slice(&row.created.to_le_bytes());
             w.bytes(&record)?;
         }
         let sum = w.sum.0;
@@ -245,6 +248,10 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
     input
         .read_exact(&mut magic)
         .context("Index file is truncated")?;
+    if OLD_MAGICS.contains(&&magic) {
+        // A previous version's cache: start empty, the next save replaces it.
+        return Ok(Snapshot::default());
+    }
     if &magic != MAGIC {
         bail!("Unknown index format; it will be rebuilt");
     }
@@ -290,6 +297,7 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
             let offset = u32::from_le_bytes(field(16..20).try_into().unwrap());
             let dir = u32::from_le_bytes(field(20..24).try_into().unwrap());
             let len = u16::from_le_bytes(field(24..26).try_into().unwrap());
+            let created = i64::from_le_bytes(field(27..35).try_into().unwrap());
             let kind = match record[26] {
                 0 => Kind::File,
                 1 => Kind::Folder,
@@ -305,7 +313,9 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
                 bail!("Index file is inconsistent");
             }
             next_name = offset + u32::from(len);
-            rows.push(Row::from_raw(size, modified, offset, dir, len, kind));
+            rows.push(Row::from_raw(
+                size, modified, created, offset, dir, len, kind,
+            ));
         }
     }
     if next_name as usize != names.len() {

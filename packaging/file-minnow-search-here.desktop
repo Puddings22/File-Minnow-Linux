@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Service
+MimeType=inode/directory;
+Actions=search;
+X-KDE-Priority=TopLevel
+X-KDE-StartupNotify=false
+
+[Desktop Action search]
+Name=Search Here with File Minnow
+Icon=file-minnow
+Exec=file-minnow show --in %f

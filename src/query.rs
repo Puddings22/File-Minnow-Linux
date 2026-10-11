@@ -1,6 +1,7 @@
 use crate::{
+    fold::fold,
     index::{Entry, Kind, Snapshot},
-    table::{NO_DIR, Table},
+    table::{NO_DATE, NO_DIR, Table},
 };
 use anyhow::{Context, Result, bail};
 use regex::bytes::{Regex, RegexBuilder};
@@ -18,9 +19,13 @@ enum Expr {
         path: bool,
     },
     Literal {
-        needle: Box<[u8]>,
+        /// The needle as typed (for `case:`), and its folded form, which is
+        /// what case- and accent-insensitive matching compares.
+        needle: Needle,
         path: bool,
         case: bool,
+        /// `wholeword:`: the match may not touch letters or digits.
+        whole: bool,
         /// For path literals: which parent directories contain the needle,
         /// computed once per query instead of once per entry.
         dir_hits: Vec<bool>,
@@ -28,7 +33,7 @@ enum Expr {
     /// Name wildcards with one literal part: `x*`, `*x` and `x`-with-`*`s at
     /// both ends become prefix, suffix or substring checks instead of a regex.
     Affix {
-        needle: Box<[u8]>,
+        needle: Needle,
         case: bool,
         prefix: bool,
     },
@@ -36,6 +41,76 @@ enum Expr {
     Ext(Vec<Vec<u8>>),
     Size(Range),
     Date(Range),
+    /// `dc:` creation date.
+    Created(Range),
+    /// `dupe:` names that occur more than once; rows found in `prepare`.
+    Dupe(Vec<bool>),
+    /// `empty:` folders with nothing indexed inside.
+    Empty,
+    /// `parent:<folder>` entries directly inside the folder; `dir` ids found in `prepare`.
+    Parent {
+        path: Vec<u8>,
+        dirs: Vec<bool>,
+    },
+    /// `child:<name>` folders with an entry of that name; rows found in `prepare`.
+    Child {
+        needle: Needle,
+        rows: Vec<bool>,
+    },
+    /// `content:<text>` files whose contents contain the text. Slow: each
+    /// candidate file is read, so it is evaluated last, only on the rows the
+    /// other terms left.
+    Content {
+        needle: Needle,
+        case: bool,
+    },
+}
+/// Files larger than this are not read for `content:`.
+const CONTENT_MAX_BYTES: u64 = 16 << 20;
+/// Whether a file's contents contain `needle` (ASCII case-insensitive
+/// unless `case`), reading into a reusable buffer.
+fn file_contains(
+    path: &std::path::Path,
+    size: u64,
+    needle: &Needle,
+    case: bool,
+    buffer: &mut Vec<u8>,
+) -> bool {
+    use std::io::Read;
+    if size > CONTENT_MAX_BYTES || needle.raw.is_empty() {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    buffer.clear();
+    if file
+        .by_ref()
+        .take(CONTENT_MAX_BYTES)
+        .read_to_end(buffer)
+        .is_err()
+    {
+        return false;
+    }
+    contains_bytes(buffer, needle.bytes(case), case, false)
+}
+#[derive(Debug)]
+struct Needle {
+    raw: Box<[u8]>,
+    folded: Box<[u8]>,
+}
+impl Needle {
+    fn new(text: &str) -> Self {
+        Self {
+            raw: text.as_bytes().into(),
+            folded: fold(text.as_bytes()).into(),
+        }
+    }
+    /// The bytes compared against unfolded text: exact for `case:`,
+    /// otherwise the folded form (which the scanner compares ignoring ASCII case).
+    fn bytes(&self, case: bool) -> &[u8] {
+        if case { &self.raw } else { &self.folded }
+    }
 }
 #[derive(Debug)]
 struct Range {
@@ -84,7 +159,7 @@ fn lex(input: &str) -> Result<Vec<Token>> {
             continue;
         }
         // Comparators belong to metadata atoms, not grouping tokens.
-        if (c == '<' || c == '>') && (text == "size:" || text == "dm:") {
+        if (c == '<' || c == '>') && matches!(text.as_str(), "size:" | "dm:" | "dc:") {
             text.push(c);
             continue;
         }
@@ -254,6 +329,7 @@ fn term(input: &str, literal: bool) -> Result<Expr> {
     let mut case = false;
     let mut path = false;
     let mut regex = false;
+    let mut whole = false;
     if !literal {
         loop {
             if let Some(s) = text.strip_prefix("case:") {
@@ -261,6 +337,12 @@ fn term(input: &str, literal: bool) -> Result<Expr> {
                 text = s;
             } else if let Some(s) = text.strip_prefix("path:") {
                 path = true;
+                text = s;
+            } else if let Some(s) = text
+                .strip_prefix("wholeword:")
+                .or_else(|| text.strip_prefix("ww:"))
+            {
+                whole = true;
                 text = s;
             } else if let Some(s) = text.strip_prefix("regex:") {
                 regex = true;
@@ -274,7 +356,46 @@ fn term(input: &str, literal: bool) -> Result<Expr> {
             match text {
                 "file:" => return Ok(Expr::Kind(Kind::File)),
                 "folder:" => return Ok(Expr::Kind(Kind::Folder)),
+                "dupe:" => return Ok(Expr::Dupe(Vec::new())),
+                "empty:" => return Ok(Expr::Empty),
                 _ => {}
+            }
+            if let Some(s) = text
+                .strip_prefix("parent:")
+                .or_else(|| text.strip_prefix("infolder:"))
+            {
+                if s.is_empty() {
+                    bail!("parent: requires a folder path");
+                }
+                let mut path = s.as_bytes().to_vec();
+                while path.len() > 1 && path.ends_with(b"/") {
+                    path.pop();
+                }
+                return Ok(Expr::Parent {
+                    path,
+                    dirs: Vec::new(),
+                });
+            }
+            if let Some(s) = text.strip_prefix("child:") {
+                if s.is_empty() {
+                    bail!("child: requires a file or folder name");
+                }
+                return Ok(Expr::Child {
+                    needle: Needle::new(s),
+                    rows: Vec::new(),
+                });
+            }
+            if let Some(s) = text.strip_prefix("dc:") {
+                return Ok(Expr::Created(range(s, true)?));
+            }
+            if let Some(s) = text.strip_prefix("content:") {
+                if s.is_empty() {
+                    bail!("content: requires text to look for");
+                }
+                return Ok(Expr::Content {
+                    needle: Needle::new(s),
+                    case,
+                });
             }
             if let Some((_, _, extensions)) = TYPE_FILTERS.iter().find(|(_, m, _)| *m == text) {
                 return Ok(Expr::Ext(
@@ -311,9 +432,10 @@ fn term(input: &str, literal: bool) -> Result<Expr> {
     path |= text.contains('/');
     if !regex && !text.contains(['*', '?']) {
         return Ok(Expr::Literal {
-            needle: text.as_bytes().into(),
+            needle: Needle::new(text),
             path,
             case,
+            whole,
             dir_hits: Vec::new(),
         });
     }
@@ -321,13 +443,14 @@ fn term(input: &str, literal: bool) -> Result<Expr> {
         let inner = text.trim_start_matches('*').trim_end_matches('*');
         let (lead, trail) = (text.starts_with('*'), text.ends_with('*'));
         if !inner.is_empty() && !inner.contains('*') {
-            let needle: Box<[u8]> = inner.as_bytes().into();
+            let needle = Needle::new(inner);
             match (lead, trail) {
                 (true, true) => {
                     return Ok(Expr::Literal {
                         needle,
                         path: false,
                         case,
+                        whole,
                         dir_hits: Vec::new(),
                     });
                 }
@@ -373,7 +496,7 @@ fn term(input: &str, literal: bool) -> Result<Expr> {
         .context("Invalid or overly complex regex")?;
     Ok(Expr::Text { regex, path })
 }
-fn affix(name: &[u8], needle: &[u8], case: bool, prefix: bool) -> bool {
+fn affix_bytes(name: &[u8], needle: &[u8], case: bool, prefix: bool) -> bool {
     if name.len() < needle.len() {
         return false;
     }
@@ -388,22 +511,60 @@ fn affix(name: &[u8], needle: &[u8], case: bool, prefix: bool) -> bool {
         part.eq_ignore_ascii_case(needle)
     }
 }
-fn contains(hay: &[u8], needle: &[u8], case: bool) -> bool {
-    if case {
-        memchr::memmem::find(hay, needle).is_some()
-    } else if hay.len() < needle.len() {
-        false
+/// Prefix or suffix test; accent-insensitive for names with non-ASCII bytes.
+fn affix(name: &[u8], needle: &Needle, case: bool, prefix: bool) -> bool {
+    affix_bytes(name, needle.bytes(case), case, prefix)
+        || (!case && !name.is_ascii() && affix_bytes(&fold(name), &needle.folded, false, prefix))
+}
+/// Positions where `needle` occurs in `hay`, ignoring ASCII case unless `case`.
+fn occurrences<'a>(
+    hay: &'a [u8],
+    needle: &'a [u8],
+    case: bool,
+) -> impl Iterator<Item = usize> + 'a {
+    let (first, upper) = if case || needle.is_empty() {
+        (
+            needle.first().copied().unwrap_or(0),
+            needle.first().copied().unwrap_or(0),
+        )
     } else {
-        memchr::memchr2_iter(
+        (
             needle[0].to_ascii_lowercase(),
             needle[0].to_ascii_uppercase(),
-            hay,
         )
-        .any(|i| {
-            hay.get(i..i + needle.len())
-                .is_some_and(|s| s.eq_ignore_ascii_case(needle))
+    };
+    memchr::memchr2_iter(first, upper, hay).filter(move |&i| {
+        hay.get(i..i + needle.len()).is_some_and(|s| {
+            if case {
+                s == needle
+            } else {
+                s.eq_ignore_ascii_case(needle)
+            }
         })
+    })
+}
+fn contains_bytes(hay: &[u8], needle: &[u8], case: bool, whole: bool) -> bool {
+    if needle.is_empty() {
+        return true;
     }
+    if !whole {
+        return if case {
+            memchr::memmem::find(hay, needle).is_some()
+        } else {
+            occurrences(hay, needle, false).next().is_some()
+        };
+    }
+    occurrences(hay, needle, case).any(|i| {
+        let word = |b: u8| b.is_ascii_alphanumeric() || b >= 0x80;
+        let before = i > 0 && word(hay[i - 1]);
+        let after = hay.get(i + needle.len()).is_some_and(|b| word(*b));
+        !before && !after
+    })
+}
+/// Substring test; accent-insensitive for text with non-ASCII bytes.
+fn contains(hay: &[u8], needle: &Needle, case: bool, whole: bool) -> bool {
+    contains_bytes(hay, needle.bytes(case), case, whole)
+        || (!case && !hay.is_ascii() && contains_bytes(&fold(hay), &needle.folded, false, whole))
 }
 
 /// What a query can ask about one entry, whether it is a materialized
@@ -413,9 +574,35 @@ trait View {
     fn kind(&self) -> Kind;
     fn size(&self) -> u64;
     fn modified(&self) -> i64;
+    fn created(&self) -> i64;
     fn path(&mut self) -> &[u8];
-    fn path_contains(&mut self, needle: &[u8], case: bool, _dir_hits: &[bool]) -> bool {
-        contains(self.path(), needle, case)
+    fn path_contains(
+        &mut self,
+        needle: &Needle,
+        case: bool,
+        whole: bool,
+        _dir_hits: &[bool],
+    ) -> bool {
+        contains(self.path(), needle, case, whole)
+    }
+    /// The parent folder path, without a trailing slash.
+    fn parent_path(&mut self) -> Option<Vec<u8>> {
+        let path = self.path();
+        if path == b"/" {
+            return None;
+        }
+        Some(match path.iter().rposition(|b| *b == b'/') {
+            Some(0) => b"/".to_vec(),
+            Some(i) => path[..i].to_vec(),
+            None => Vec::new(),
+        })
+    }
+    /// Table-wide facts (duplicates, folder contents) are only known to rows.
+    fn row(&self) -> Option<usize> {
+        None
+    }
+    fn empty_folder(&self) -> bool {
+        false
     }
 }
 impl View for &Entry {
@@ -430,6 +617,9 @@ impl View for &Entry {
     }
     fn modified(&self) -> i64 {
         self.modified
+    }
+    fn created(&self) -> i64 {
+        self.created
     }
     fn path(&mut self) -> &[u8] {
         &self.path
@@ -454,6 +644,9 @@ impl View for RowView<'_> {
     fn modified(&self) -> i64 {
         self.table.row(self.index).modified
     }
+    fn created(&self) -> i64 {
+        self.table.row(self.index).created
+    }
     fn path(&mut self) -> &[u8] {
         if !self.built {
             self.table.write_path(self.index, self.scratch);
@@ -461,17 +654,35 @@ impl View for RowView<'_> {
         }
         self.scratch
     }
-    fn path_contains(&mut self, needle: &[u8], case: bool, dir_hits: &[bool]) -> bool {
+    fn parent_path(&mut self) -> Option<Vec<u8>> {
+        self.table.dir_path(self.index).map(|d| d.to_vec())
+    }
+    fn row(&self) -> Option<usize> {
+        Some(self.index)
+    }
+    fn empty_folder(&self) -> bool {
+        self.table.is_empty_folder(self.index)
+    }
+    fn path_contains(
+        &mut self,
+        needle: &Needle,
+        case: bool,
+        whole: bool,
+        dir_hits: &[bool],
+    ) -> bool {
         let dir = self.table.row(self.index).dir;
         let Some(dir_path) = self.table.dir_path(self.index) else {
-            return contains(self.table.name(self.index), needle, case);
+            return contains(self.table.name(self.index), needle, case, whole);
         };
-        if dir_hits.get(dir as usize) == Some(&true) {
+        if !whole && dir_hits.get(dir as usize) == Some(&true) {
             return true;
+        }
+        if whole {
+            return contains(self.path(), needle, case, true);
         }
         // Remaining matches must touch the separator or the name: check the
         // last needle-1 bytes of the folder, the separator and the name.
-        let keep = needle.len().saturating_sub(1).min(dir_path.len());
+        let keep = needle.raw.len().saturating_sub(1).min(dir_path.len());
         self.scratch.clear();
         self.scratch
             .extend_from_slice(&dir_path[dir_path.len() - keep..]);
@@ -480,7 +691,7 @@ impl View for RowView<'_> {
         }
         self.scratch.extend_from_slice(self.table.name(self.index));
         self.built = false;
-        contains(self.scratch, needle, case)
+        contains(self.scratch, needle, case, false)
     }
 }
 
@@ -494,12 +705,50 @@ impl Expr {
                 path: true,
                 case,
                 dir_hits,
+                ..
             } => {
                 *dir_hits = table
                     .dirs()
                     .iter()
-                    .map(|d| contains(d, needle, *case))
+                    .map(|d| contains(d, needle, *case, false))
                     .collect();
+            }
+            Self::Dupe(rows) => {
+                // Equal names sit next to each other in the name order.
+                let order = table.name_order();
+                let mut dupes = vec![false; table.len()];
+                let mut start = 0;
+                while start < order.len() {
+                    let name = table.name(order[start] as usize);
+                    let mut end = start + 1;
+                    while end < order.len() && table.name(order[end] as usize) == name {
+                        end += 1;
+                    }
+                    if end - start > 1 {
+                        for i in &order[start..end] {
+                            dupes[*i as usize] = true;
+                        }
+                    }
+                    start = end;
+                }
+                *rows = dupes;
+            }
+            Self::Parent { path, dirs } => {
+                *dirs = table.dirs().iter().map(|d| d == path.as_slice()).collect();
+            }
+            Self::Child { needle, rows } => {
+                let dir_rows = table.dir_rows();
+                let mut parents = vec![false; table.len()];
+                for i in 0..table.len() {
+                    let dir = table.row(i).dir;
+                    if dir != NO_DIR
+                        && dir_rows[dir as usize] != u32::MAX
+                        && name_is(table.name(i), needle)
+                    {
+                        parents[dir_rows[dir as usize] as usize] = true;
+                    }
+                }
+                *rows = parents;
             }
             _ => {}
         }
@@ -521,12 +770,13 @@ impl Expr {
                 needle,
                 path,
                 case,
+                whole,
                 dir_hits,
             } => {
                 if *path {
-                    e.path_contains(needle, *case, dir_hits)
+                    e.path_contains(needle, *case, *whole, dir_hits)
                 } else {
-                    contains(e.name(), needle, *case)
+                    contains(e.name(), needle, *case, *whole)
                 }
             }
             Self::Affix {
@@ -543,10 +793,34 @@ impl Expr {
                     })
                 }
             }
-            Self::Size(r) => e.kind() == Kind::File && r.contains(e.size() as i128),
+            Self::Size(r) => sized(e.kind()) && r.contains(e.size() as i128),
             Self::Date(r) => r.contains(e.modified() as i128),
+            Self::Created(r) => e.created() != NO_DATE && r.contains(e.created() as i128),
+            Self::Dupe(rows) => e.row().is_some_and(|i| rows.get(i) == Some(&true)),
+            Self::Empty => e.empty_folder(),
+            Self::Parent { path, .. } => e.parent_path().as_deref() == Some(path.as_slice()),
+            Self::Child { rows, .. } => e.row().is_some_and(|i| rows.get(i) == Some(&true)),
+            Self::Content { needle, case } => {
+                use std::os::unix::ffi::OsStrExt;
+                e.kind() == Kind::File && {
+                    let size = e.size();
+                    let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(e.path()));
+                    file_contains(&path, size, needle, *case, &mut Vec::new())
+                }
+            }
         }
     }
+    fn reads_files(&self) -> bool {
+        matches!(self, Self::Content { .. })
+    }
+}
+/// Files have a size; folders carry the total of the files inside them.
+fn sized(kind: Kind) -> bool {
+    matches!(kind, Kind::File | Kind::Folder)
+}
+/// Whole-name match, ignoring case and accents.
+fn name_is(name: &[u8], needle: &Needle) -> bool {
+    name.eq_ignore_ascii_case(&needle.folded) || (!name.is_ascii() && fold(name) == *needle.folded)
 }
 /// One bit per table row.
 struct Bits {
@@ -632,43 +906,51 @@ fn commonness(b: u8) -> u8 {
     }
 }
 
-/// Rows whose name contains `needle`, found by scanning the shared name
-/// buffer once instead of testing each name separately. Names are stored
-/// back to back in row order, so hit positions map to rows with one cursor.
-fn name_hits(table: &Table, needle: &[u8], case: bool, cancel: &dyn Fn() -> bool) -> Result<Bits> {
-    let (names, _, rows) = table.parts();
-    let mut bits = Bits::zeros(rows.len());
+/// Scans one buffer of back-to-back entries for `needle` and calls `found`
+/// with the index of each entry that contains it. Hit positions map to
+/// entries with one forward cursor, so the whole buffer is read once.
+fn scan(
+    buffer: &[u8],
+    entries: usize,
+    range: impl Fn(usize) -> (usize, usize),
+    needle: &[u8],
+    case: bool,
+    cancel: &dyn Fn() -> bool,
+    mut found: impl FnMut(usize),
+) -> Result<()> {
     let n = needle.len();
-    let mut row = 0;
+    if n == 0 || entries == 0 {
+        return Ok(());
+    }
+    let mut entry = 0;
     let mut skip_to = 0;
     let mut checks = 0_u32;
-    let mut hit = |start: usize, bits: &mut Bits| -> Option<usize> {
-        // Advance to the row holding `start`, then require the match to end
-        // inside that same name.
-        while row < rows.len() {
-            let (offset, len) = rows[row].name_range();
-            let end = offset as usize + len as usize;
+    let mut hit = |start: usize, found: &mut dyn FnMut(usize)| -> Option<usize> {
+        // Advance to the entry holding `start`, then require the match to
+        // end inside that same entry.
+        while entry < entries {
+            let (offset, end) = range(entry);
             if start < end {
-                if start >= offset as usize && start + n <= end {
-                    bits.set(row);
+                if start >= offset && start + n <= end {
+                    found(entry);
                     return Some(end);
                 }
                 return None;
             }
-            row += 1;
+            entry += 1;
         }
         None
     };
     if case {
         let finder = memchr::memmem::Finder::new(needle);
         let mut from = 0;
-        while let Some(k) = finder.find(&names[from..]) {
+        while let Some(k) = finder.find(&buffer[from..]) {
             let start = from + k;
             checks += 1;
             if checks.is_multiple_of(65_536) && cancel() {
                 bail!("Query cancelled");
             }
-            from = hit(start, &mut bits).unwrap_or(start + 1);
+            from = hit(start, &mut found).unwrap_or(start + 1);
         }
     } else {
         let at = (0..n).min_by_key(|i| commonness(needle[*i])).unwrap_or(0);
@@ -676,7 +958,7 @@ fn name_hits(table: &Table, needle: &[u8], case: bool, cancel: &dyn Fn() -> bool
             needle[at].to_ascii_lowercase(),
             needle[at].to_ascii_uppercase(),
         );
-        for pos in memchr::memchr2_iter(lower, upper, names) {
+        for pos in memchr::memchr2_iter(lower, upper, buffer) {
             checks += 1;
             if checks.is_multiple_of(65_536) && cancel() {
                 bail!("Query cancelled");
@@ -685,13 +967,61 @@ fn name_hits(table: &Table, needle: &[u8], case: bool, cancel: &dyn Fn() -> bool
                 continue;
             };
             if start < skip_to
-                || start + n > names.len()
-                || !names[start..start + n].eq_ignore_ascii_case(needle)
+                || start + n > buffer.len()
+                || !buffer[start..start + n].eq_ignore_ascii_case(needle)
             {
                 continue;
             }
-            if let Some(end) = hit(start, &mut bits) {
+            if let Some(end) = hit(start, &mut found) {
                 skip_to = end;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rows whose name contains `needle`: one pass over the shared names buffer
+/// and, unless `case:`, one over the folded names of non-ASCII rows.
+fn name_hits(
+    table: &Table,
+    needle: &Needle,
+    case: bool,
+    whole: bool,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Bits> {
+    let (names, _, rows) = table.parts();
+    let mut bits = Bits::zeros(rows.len());
+    scan(
+        names,
+        rows.len(),
+        |i| {
+            let (offset, len) = rows[i].name_range();
+            (offset as usize, offset as usize + len as usize)
+        },
+        needle.bytes(case),
+        case,
+        cancel,
+        |i| bits.set(i),
+    )?;
+    if !case {
+        let folded = table.folded();
+        scan(
+            &folded.bytes,
+            folded.len(),
+            |k| folded.range(k),
+            &needle.folded,
+            false,
+            cancel,
+            |k| bits.set(folded.rows[k] as usize),
+        )?;
+    }
+    if whole {
+        // Keep only the rows where an occurrence stands as a whole word.
+        let hits: Vec<usize> = bits.ones_iter().collect();
+        bits = Bits::zeros(rows.len());
+        for i in hits {
+            if contains(table.name(i), needle, case, true) {
+                bits.set(i);
             }
         }
     }
@@ -701,6 +1031,15 @@ fn name_hits(table: &Table, needle: &[u8], case: bool, cancel: &dyn Fn() -> bool
 impl Expr {
     /// Evaluates the whole query over a table, one tight pass per term.
     fn eval(&self, table: &Table, cancel: &dyn Fn() -> bool) -> Result<Bits> {
+        self.eval_within(table, None, cancel)
+    }
+    /// Like `eval`, but a term that reads files only looks at `candidates`.
+    fn eval_within(
+        &self,
+        table: &Table,
+        candidates: Option<&Bits>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Bits> {
         let len = table.len();
         let per_row = |test: &mut dyn FnMut(usize) -> bool| -> Result<Bits> {
             let mut bits = Bits::zeros(len);
@@ -717,40 +1056,80 @@ impl Expr {
         Ok(match self {
             Self::All => Bits::ones(len),
             Self::And(terms) => {
-                let mut bits = terms[0].eval(table, cancel)?;
-                for term in &terms[1..] {
+                // Cheap terms first; terms that read files then only test
+                // the rows those left.
+                let (slow, fast): (Vec<&Expr>, Vec<&Expr>) =
+                    terms.iter().partition(|t| t.reads_files());
+                let mut bits = match fast.first() {
+                    Some(first) => first.eval_within(table, candidates, cancel)?,
+                    None => Bits::ones(len),
+                };
+                for term in fast.iter().skip(1) {
                     if bits.is_empty() {
                         break;
                     }
-                    bits.and(&term.eval(table, cancel)?);
+                    bits.and(&term.eval_within(table, candidates, cancel)?);
+                }
+                for term in slow {
+                    if bits.is_empty() {
+                        break;
+                    }
+                    bits.and(&term.eval_within(table, Some(&bits), cancel)?);
                 }
                 bits
             }
             Self::Or(terms) => {
-                let mut bits = terms[0].eval(table, cancel)?;
+                let mut bits = terms[0].eval_within(table, candidates, cancel)?;
                 for term in &terms[1..] {
-                    bits.or(&term.eval(table, cancel)?);
+                    bits.or(&term.eval_within(table, candidates, cancel)?);
                 }
                 bits
             }
             Self::Not(term) => {
-                let mut bits = term.eval(table, cancel)?;
+                let mut bits = term.eval_within(table, candidates, cancel)?;
                 bits.invert();
+                bits
+            }
+            Self::Content { needle, case } => {
+                let mut bits = Bits::zeros(len);
+                let mut buffer = Vec::new();
+                let mut path = Vec::new();
+                let rows: Vec<usize> = match candidates {
+                    Some(c) => c.ones_iter().collect(),
+                    None => (0..len).collect(),
+                };
+                for i in rows {
+                    if cancel() {
+                        bail!("Query cancelled");
+                    }
+                    let row = table.row(i);
+                    if row.kind != Kind::File || row.size > CONTENT_MAX_BYTES {
+                        continue;
+                    }
+                    table.write_path(i, &mut path);
+                    use std::os::unix::ffi::OsStrExt;
+                    let file = std::path::Path::new(std::ffi::OsStr::from_bytes(&path));
+                    if file_contains(file, row.size, needle, *case, &mut buffer) {
+                        bits.set(i);
+                    }
+                }
                 bits
             }
             Self::Literal {
                 needle,
                 path: false,
                 case,
+                whole,
                 ..
-            } => name_hits(table, needle, *case, cancel)?,
+            } => name_hits(table, needle, *case, *whole, cancel)?,
             Self::Literal {
                 needle,
                 path: true,
                 case,
+                whole,
                 dir_hits,
             } => {
-                if needle.contains(&b'/') {
+                if *whole || needle.raw.contains(&b'/') {
                     // The match may cross the folder/name separator.
                     let mut scratch = Vec::new();
                     per_row(&mut |index| {
@@ -760,11 +1139,11 @@ impl Expr {
                             scratch: &mut scratch,
                             built: false,
                         }
-                        .path_contains(needle, *case, dir_hits)
+                        .path_contains(needle, *case, *whole, dir_hits)
                     })?
                 } else {
                     // Without a '/', a match lies wholly in the folder or the name.
-                    let mut bits = name_hits(table, needle, *case, cancel)?;
+                    let mut bits = name_hits(table, needle, *case, false, cancel)?;
                     let (_, _, rows) = table.parts();
                     for (i, row) in rows.iter().enumerate() {
                         if row.dir != NO_DIR && dir_hits[row.dir as usize] {
@@ -800,14 +1179,45 @@ impl Expr {
             })?,
             Self::Size(range) => per_row(&mut |i| {
                 let row = table.row(i);
-                row.kind == Kind::File && range.contains(row.size as i128)
+                sized(row.kind) && range.contains(row.size as i128)
             })?,
             Self::Date(range) => per_row(&mut |i| range.contains(table.row(i).modified as i128))?,
+            Self::Created(range) => per_row(&mut |i| {
+                let created = table.row(i).created;
+                created != NO_DATE && range.contains(created as i128)
+            })?,
+            Self::Dupe(rows) | Self::Child { rows, .. } => {
+                per_row(&mut |i| rows.get(i) == Some(&true))?
+            }
+            Self::Empty => per_row(&mut |i| table.is_empty_folder(i))?,
+            Self::Parent { dirs, .. } => per_row(&mut |i| {
+                let dir = table.row(i).dir;
+                dir != NO_DIR && dirs.get(dir as usize) == Some(&true)
+            })?,
         })
     }
 }
 pub struct Query(Expr);
 impl Query {
+    /// The folded text of the positive literal terms (for highlighting
+    /// matches in results); `case:` terms keep their case.
+    pub fn highlight_terms(&self) -> Vec<Vec<u8>> {
+        fn walk(expr: &Expr, out: &mut Vec<Vec<u8>>) {
+            match expr {
+                Expr::And(v) | Expr::Or(v) => v.iter().for_each(|x| walk(x, out)),
+                Expr::Literal { needle, .. } | Expr::Affix { needle, .. } => {
+                    out.push(needle.folded.to_vec())
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.0, &mut out);
+        out.sort();
+        out.dedup();
+        out.retain(|t| !t.is_empty());
+        out
+    }
     pub fn parse(input: &str) -> Result<Self> {
         if input.len() > 4096 {
             bail!("Query exceeds 4096 bytes");
@@ -870,6 +1280,7 @@ pub enum Sort {
     Modified,
     /// Folders first, then by extension, then by name.
     Type,
+    Created,
 }
 /// The extension of a file name (after the last dot; none for `.hidden`).
 pub fn extension(name: &[u8]) -> &[u8] {
@@ -958,17 +1369,17 @@ pub fn search(
                     .take(limit)
                     .collect()
             }
-            Sort::Size | Sort::Modified | Sort::Type => {
+            Sort::Size | Sort::Modified | Sort::Type | Sort::Created => {
                 let mut hits: Vec<u32> = match &bits {
                     Some(bits) => bits.ones_iter().map(|i| i as u32).collect(),
                     None => (0..table.len() as u32).collect(),
                 };
                 let key = |i: &u32| {
                     let row = table.row(*i as usize);
-                    if request.sort == Sort::Size {
-                        row.size as i128
-                    } else {
-                        row.modified as i128
+                    match request.sort {
+                        Sort::Size => row.size as i128,
+                        Sort::Created => row.created as i128,
+                        _ => row.modified as i128,
                     }
                 };
                 let by_type = |a: &u32, b: &u32| {
@@ -1036,12 +1447,20 @@ mod tests {
             "/data",
             "/srcfiles/thing",
             "/",
+            "/data/Projects/Știință.txt",
+            "/data/photos/École/été.jpg",
+            "/data/photos/École",
+            "/data/Übung/straße.txt",
         ];
         let entries: Vec<Entry> = names
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let kind = if p.ends_with("Projects") || *p == "/data" || *p == "/" {
+                let kind = if p.ends_with("Projects")
+                    || p.ends_with("École")
+                    || *p == "/data"
+                    || *p == "/"
+                {
                     Kind::Folder
                 } else {
                     Kind::File
@@ -1091,8 +1510,27 @@ mod tests {
             "regex:^lib",
             "path:regex:^/data/p",
             "dm:2023-11-14",
+            "dc:2023-11-14",
             "photos/",
             "sourc",
+            "stiinta",
+            "ȘTIINȚĂ",
+            "ecole",
+            "path:ecole",
+            "path:école/",
+            "ete",
+            "strasse",
+            "ss*",
+            "*ta.txt",
+            "case:Știință",
+            "wholeword:main",
+            "ww:mai",
+            "ww:path:src",
+            "ww:data/Projects",
+            "parent:/data/photos/",
+            "infolder:/data",
+            "size:>4mb",
+            "folder: size:>0",
         ] {
             let mut q = Query::parse(query).unwrap();
             q.0.prepare(&table);

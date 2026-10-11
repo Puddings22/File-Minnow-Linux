@@ -56,6 +56,9 @@ with tempfile.TemporaryDirectory(prefix='file-minnow-package-') as temp:
     for size in [16, 22, 24, 32, 48, 64, 128, 256]:
         put(ROOT / f'packaging/icons/file-minnow-{size}.png', f'usr/share/icons/hicolor/{size}x{size}/apps/file-minnow.png')
     put(ROOT / 'packaging/file-minnow.service', 'usr/lib/systemd/user/file-minnow.service')
+    # "Search here" in the file managers' folder menus (Nemo, Dolphin).
+    put(ROOT / 'packaging/file-minnow-search-here.nemo_action', 'usr/share/nemo/actions/file-minnow-search-here.nemo_action')
+    put(ROOT / 'packaging/file-minnow-search-here.desktop', 'usr/share/kio/servicemenus/file-minnow-search-here.desktop')
     put(ROOT / 'packaging/file-minnow-autostart.desktop', 'usr/share/doc/file-minnow/file-minnow-autostart.desktop')
     put(ROOT / 'LICENSE', 'usr/share/doc/file-minnow/copyright')
     put(ROOT / 'docs/manual.md', 'usr/share/doc/file-minnow/README.md')

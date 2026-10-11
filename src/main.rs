@@ -79,7 +79,12 @@ enum Command {
         search: Option<String>,
     },
     /// Show the existing window, or start it
-    Show { query: Option<String> },
+    Show {
+        query: Option<String>,
+        /// Search inside this folder (a file manager's "Search here")
+        #[arg(long = "in", value_name = "FOLDER")]
+        folder: Option<std::path::PathBuf>,
+    },
     /// Toggle the existing window, or start it
     Toggle,
     /// Quit the desktop app (leaves a separately started daemon running)
@@ -256,7 +261,23 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&settings)?);
             }
         }
-        Command::Show { query } => {
+        Command::Show { query, folder } => {
+            // A quoted folder path with a trailing slash matches everything inside it.
+            let query = match folder {
+                Some(folder) => {
+                    let folder = folder.canonicalize().unwrap_or(folder);
+                    let mut text = folder.to_string_lossy().into_owned();
+                    if !text.ends_with('/') {
+                        text.push('/');
+                    }
+                    let scoped = format!("\"{}\"", text.replace('"', ""));
+                    Some(match query {
+                        Some(q) if !q.trim().is_empty() => format!("{scoped} {q}"),
+                        _ => scoped,
+                    })
+                }
+                None => query,
+            };
             #[cfg(feature = "gui")]
             file_minnow::ui::run_with_options(
                 Vec::new(),

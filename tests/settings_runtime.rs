@@ -248,3 +248,72 @@ fn excluded_and_non_recursive_folders_are_not_watched() {
     runtime.handle.apply_settings(next).unwrap();
     wait(&runtime, |_, status| status.watched == 1);
 }
+
+#[test]
+fn offline_roots_keep_their_entries_and_added_roots_scan_alone() {
+    let (temp, root, dir, config, mut settings) = setup();
+    for i in 0..300 {
+        fs::create_dir_all(root.join(format!("d{i:03}"))).unwrap();
+    }
+    // A "drive": a root that keeps its entries while unavailable.
+    let drive = temp.path().join("drive");
+    fs::create_dir_all(drive.join("photos")).unwrap();
+    fs::write(drive.join("photos/holiday.jpg"), b"x").unwrap();
+    settings.index.roots.push(file_minnow::config::RootConfig {
+        keep_offline: true,
+        ..file_minnow::config::RootConfig::new(&drive)
+    });
+    let runtime = Runtime::configured(settings, dir, config).unwrap();
+    wait(&runtime, |s, _| s.generation > 0);
+    let has = |name: &str| {
+        runtime
+            .state
+            .read()
+            .unwrap()
+            .snapshot
+            .entries
+            .entries()
+            .iter()
+            .any(|e| e.name() == name.as_bytes())
+    };
+    assert!(has("holiday.jpg"));
+    assert!(runtime.handle.status().offline.is_empty());
+    // Unplug: the entries stay and the root is reported offline.
+    fs::remove_dir_all(&drive).unwrap();
+    let before = runtime.handle.status().generation;
+    runtime.handle.rescan(None).unwrap();
+    wait(&runtime, |s, _| s.generation > before);
+    assert!(
+        has("holiday.jpg"),
+        "entries dropped while the drive was unplugged"
+    );
+    assert_eq!(
+        runtime.handle.status().offline,
+        [drive.to_string_lossy().into_owned()]
+    );
+    // Plug it back with a change: the rescan picks it up.
+    fs::create_dir_all(drive.join("photos")).unwrap();
+    fs::write(drive.join("photos/new.jpg"), b"x").unwrap();
+    let before = runtime.handle.status().generation;
+    runtime.handle.rescan(None).unwrap();
+    wait(&runtime, |s, _| s.generation > before);
+    assert!(has("new.jpg") && !has("holiday.jpg"));
+    assert!(runtime.handle.status().offline.is_empty());
+    // Adding a root scans only that root, not the 300-folder one again.
+    let extra = temp.path().join("extra");
+    fs::create_dir_all(&extra).unwrap();
+    fs::write(extra.join("one.txt"), b"x").unwrap();
+    let mut next = runtime.handle.settings();
+    next.index
+        .roots
+        .push(file_minnow::config::RootConfig::new(&extra));
+    let before = runtime.handle.status().generation;
+    runtime.handle.apply_settings(next).unwrap();
+    wait(&runtime, |s, _| s.generation > before);
+    let status = runtime.handle.status();
+    assert!(has("one.txt"));
+    assert!(
+        status.visited < 50,
+        "added root caused a full rescan: {status:?}"
+    );
+}

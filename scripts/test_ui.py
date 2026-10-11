@@ -23,11 +23,13 @@ parser.add_argument('--daemon-first', action='store_true')
 parser.add_argument('--portal', action='store_true', help='Test the Wayland shortcut protocol with a private fixture; rendering still uses Xvfb')
 args = parser.parse_args()
 if os.environ.get('MINNOW_PRIVATE_TEST_SESSION') != '1':
-    with tempfile.TemporaryDirectory(prefix='minnow-private-session-') as isolated:
+    # The GTK file chooser can start GVfs in the private session; keep its
+    # FUSE mount out of the temporary directory so cleanup works.
+    with tempfile.TemporaryDirectory(prefix='minnow-private-session-', ignore_cleanup_errors=True) as isolated:
         private_env=os.environ.copy()
         for name,folder in [('XDG_RUNTIME_DIR','runtime'),('XDG_CONFIG_HOME','config'),('XDG_DATA_HOME','data'),('XDG_CACHE_HOME','cache')]:
             path=Path(isolated)/folder;path.mkdir(mode=0o700);private_env[name]=str(path)
-        private_env.update(MINNOW_PRIVATE_TEST_SESSION='1',GIO_USE_VFS='local',GTK_USE_PORTAL='0')
+        private_env.update(MINNOW_PRIVATE_TEST_SESSION='1',GIO_USE_VFS='local',GTK_USE_PORTAL='0',GVFS_DISABLE_FUSE='1')
         result=subprocess.run(['dbus-run-session','--',sys.executable,__file__,*sys.argv[1:]],env=private_env)
         raise SystemExit(result.returncode)
 if not os.environ.get('DBUS_SESSION_BUS_ADDRESS'):
@@ -140,7 +142,7 @@ try:
                 with client.makefile('rb') as response:
                     return json.loads(response.readline())
 
-        KEYBOARD_TAB, FILE_TYPES_TAB, INTERFACE_TAB = 4, 2, 5
+        KEYBOARD_TAB, FILE_TYPES_TAB, INTERFACE_TAB = 6, 2, 7
         def open_tab(options_window, index):
             """Selects an Options tab by keyboard, independent of label widths."""
             xdo('mousemove', '--window', options_window, '40', '29', 'click', '1')
@@ -359,7 +361,70 @@ try:
         wait_window(lambda s: s['query'] == '' and s['matches'] == 0)
         set_ui(hide_results_until_search=False)
         wait_window(lambda s: s['query'] == '' and s['matches'] == all_entries)
-        menu_checks = {'empty_until_search': True, 'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
+        # Bookmarks menu (items come from the settings) and a custom filter.
+        current = request({'command': 'settings'})['settings']
+        current['bookmarks'] = [{'name': 'PDF files', 'query': 'ext:pdf'}]
+        current['ui']['filters'] = [{'name': 'Rust code', 'query': 'ext:rs'}]
+        assert not request({'command': 'set_settings', 'settings': current})['error']
+        time.sleep(.5)
+        xdo('windowfocus', '--sync', window)
+        xdo('key', 'alt+b')
+        time.sleep(.4)
+        xdo('key', 'End', 'Return')  # the last item is the bookmark
+        wait_window(lambda s: s['query'] == 'ext:pdf' and s['matches'] == 2)
+        choose_filter('End')  # the custom filter is listed last
+        wait_window(lambda s: s['filter'] == 'ext:rs' and s['matches'] == 0)
+        xdo('key', 'ctrl+l', 'BackSpace')
+        wait_window(lambda s: s['query'] == '' and s['matches'] == 1)
+        choose_filter('Home')
+        wait_window(lambda s: s['filter'] == '' and s['matches'] == all_entries)
+        # Export the current results to CSV (path typed into the file chooser).
+        xdo('type', '--delay', '10', 'pdf')
+        wait_window(lambda s: s['query'] == 'pdf' and s['matches'] == 2)
+        export_path = base / 'results.csv'
+        xdo('key', 'alt+f')
+        time.sleep(.4)
+        xdo('key', 'e')
+        export_dialog = xdo('search', '--sync', '--onlyvisible', '--name', '^Export Results$').splitlines()[0]
+        xdo('windowfocus', '--sync', export_dialog)
+        time.sleep(.5)
+        xdo('key', 'ctrl+a')  # the default name is only partly selected
+        xdo('type', '--delay', '10', str(export_path))
+        time.sleep(.5)
+        subprocess.run(['import', '-quiet', '-window', 'root', str(output / 'export-dialog.png')], env=env, check=True)
+        xdo('key', 'Return')
+        deadline = time.monotonic() + 8
+        while not export_path.exists() or len(export_path.read_text().splitlines()) < 3:
+            if time.monotonic() > deadline:
+                subprocess.run(['import', '-quiet', '-window', 'root', str(output / 'export-failed.png')], env=env, check=True)
+                raise AssertionError('export did not finish')
+            time.sleep(.1)
+        exported = export_path.read_text().splitlines()
+        assert exported[0] == 'Name,Path,Size,Modified,Created,Type' and len(exported) == 3, exported
+        assert any(line.startswith('draft.pdf,') for line in exported) and all(',file' in line for line in exported[1:]), exported
+        # View menu: Preview Pane on, Created column on; both remembered.
+        xdo('windowfocus', '--sync', window)
+        xdo('mousemove', '--window', window, '150', '107', 'click', '1')
+        for keys in [['End'], ['End', 'Up']]:
+            xdo('key', 'alt+v')
+            time.sleep(.4)
+            xdo('key', *keys, 'Return')
+            time.sleep(.4)
+        deadline = time.monotonic() + 5
+        while True:
+            saved = json.loads(memory_file.read_text()) if memory_file.exists() else {}
+            if saved.get('preview') is True and 'Created' not in saved.get('hidden_columns', ['Created']):
+                break
+            assert time.monotonic() < deadline, f'view settings not saved: {saved}'
+            time.sleep(.1)
+        subprocess.run(['import', '-quiet', '-window', window, str(output / 'preview.png')], env=env, check=True)
+        # "Search here" from a file manager: show --in scopes the search to a folder.
+        subprocess.run([binary, '--data-dir', str(cache), 'show', '--in', str(files)], env=env, check=True, timeout=10)
+        wait_window(lambda s: s['query'] == f'"{files.resolve()}/"' and s['matches'] == all_entries - 1)
+        xdo('windowfocus', '--sync', window)
+        xdo('key', 'ctrl+l', 'BackSpace')
+        wait_window(lambda s: s['query'] == '')
+        menu_checks = {'bookmarks_menu': True, 'custom_filter': True, 'export_csv': True, 'view_menu_remembered': True, 'show_in_folder_scope': True, 'empty_until_search': True, 'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
         # Excluded file types: the default list hides *.tmp.
         assert request({'command': 'search', 'query': 'scratch', 'sort': 'Name', 'descending': False, 'limit': 10, 'offset': 0})['search']['total'] == 0, 'default file types were indexed'
         xdo('windowfocus', '--sync', window)
@@ -442,6 +507,23 @@ try:
         if args.tray:
             import dbus
             from Xlib import display as xdisplay, protocol, X
+            # Hiding the window records the search in the history file.
+            xdo('windowfocus', '--sync', window)
+            xdo('key', 'ctrl+l')
+            xdo('type', '--delay', '10', 'invoice')
+            wait_window(lambda s: s['query'] == 'invoice')
+            window_state('hide')
+            wait_window(lambda s: not s['visible'])
+            history_file = cache / 'history.json'
+            deadline = time.monotonic() + 5
+            while not history_file.exists() or 'invoice' not in history_file.read_text():
+                assert time.monotonic() < deadline, 'search history not recorded'
+                time.sleep(.1)
+            window_state('show')
+            wait_window(lambda s: s['visible'])
+            xdo('key', 'ctrl+l', 'BackSpace')
+            wait_window(lambda s: s['query'] == '')
+            history_recorded = True
             expected = 'desktop portal' if args.portal else '(X11)'
             wait_window(lambda s: s['tray_available'] and expected in s['hotkey_status'])
             if args.portal:
@@ -508,7 +590,7 @@ try:
             app.wait(timeout=8)
             assert app.returncode == 0
             connection.close()
-            desktop_checks = {'tray_registration': True, 'tray_icon': True, 'tray_activation': True, 'tray_menu_pause': True, 'x11_shortcut_toggle': not args.portal, 'shortcut_portal_protocol': args.portal, 'native_wayland_rendering': False, 'close_to_tray': True, 'tray_disabled_restores_window': True, 'no_tray_close_quits': True}
+            desktop_checks = {'search_history_recorded': history_recorded, 'tray_registration': True, 'tray_icon': True, 'tray_activation': True, 'tray_menu_pause': True, 'x11_shortcut_toggle': not args.portal, 'shortcut_portal_protocol': args.portal, 'native_wayland_rendering': False, 'close_to_tray': True, 'tray_disabled_restores_window': True, 'no_tray_close_quits': True}
         else:
             current = window_state()
             assert not current['tray_available']

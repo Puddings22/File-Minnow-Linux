@@ -1,5 +1,5 @@
 //! Real modal GTK Options dialog. All edits are staged until Apply/OK.
-use crate::config::{self, RawPath, RootConfig, Schedule, Settings};
+use crate::config::{self, Bookmark, Filter, RawPath, RootConfig, Schedule, Settings};
 use gtk::{gdk, gio, glib, prelude::*};
 use std::{
     cell::{Cell, RefCell},
@@ -65,6 +65,46 @@ impl OptionsWindow {
             Some(&gtk::Label::new(Some("Search"))),
         );
         body.append_page(
+            &named_queries(
+                draft.clone(),
+                "Filters add a search of your own to the drop-down beside the search box. The filter's search is combined with whatever you type, like the built-in Picture or Document filters.",
+                "New filter",
+                Rc::new(|s: &Settings| {
+                    s.ui.filters
+                        .iter()
+                        .map(|f| (f.name.clone(), f.query.clone()))
+                        .collect()
+                }),
+                Rc::new(|s: &mut Settings, pairs: Vec<(String, String)>| {
+                    s.ui.filters = pairs
+                        .into_iter()
+                        .map(|(name, query)| Filter { name, query })
+                        .collect();
+                }),
+            ),
+            Some(&gtk::Label::new(Some("Filters"))),
+        );
+        body.append_page(
+            &named_queries(
+                draft.clone(),
+                "Bookmarks are saved searches, opened from the Bookmarks menu.",
+                "New bookmark",
+                Rc::new(|s: &Settings| {
+                    s.bookmarks
+                        .iter()
+                        .map(|b| (b.name.clone(), b.query.clone()))
+                        .collect()
+                }),
+                Rc::new(|s: &mut Settings, pairs: Vec<(String, String)>| {
+                    s.bookmarks = pairs
+                        .into_iter()
+                        .map(|(name, query)| Bookmark { name, query })
+                        .collect();
+                }),
+            ),
+            Some(&gtk::Label::new(Some("Bookmarks"))),
+        );
+        body.append_page(
             &keyboard(
                 draft.clone(),
                 record.clone(),
@@ -118,6 +158,163 @@ impl OptionsWindow {
     pub fn error(&self, error: &str) {
         self.error_label.set_text(error);
     }
+    /// Switches to the tab with this label.
+    pub fn select_tab(&self, name: &str) {
+        for i in 0..self.body.n_pages() {
+            let label = self
+                .body
+                .nth_page(Some(i))
+                .and_then(|page| self.body.tab_label_text(&page));
+            if label.as_deref() == Some(name) {
+                self.body.set_current_page(Some(i));
+            }
+        }
+    }
+}
+type Pairs = Vec<(String, String)>;
+type PairsSetter = Rc<dyn Fn(&mut Settings, Pairs)>;
+/// A tab editing a list of (name, search) pairs: filters and bookmarks.
+fn named_queries(
+    draft: Rc<RefCell<Settings>>,
+    help: &str,
+    new_name: &str,
+    get: Rc<dyn Fn(&Settings) -> Pairs>,
+    set: PairsSetter,
+) -> gtk::Box {
+    let page = page();
+    page.pack_start(&caption(help), false, false, 0);
+    let store = gtk::ListStore::new(&[String::static_type(), String::static_type()]);
+    for (name, query) in get(&draft.borrow()) {
+        store.insert_with_values(None, &[(0, &name), (1, &query)]);
+    }
+    let tree = gtk::TreeView::with_model(&store);
+    for (title, column) in [("Name", 0), ("Search", 1)] {
+        let cell = gtk::CellRendererText::new();
+        cell.set_property("ellipsize", gtk::pango::EllipsizeMode::End);
+        let view = gtk::TreeViewColumn::new();
+        view.set_title(title);
+        view.set_resizable(true);
+        view.set_expand(column == 1);
+        if column == 0 {
+            view.set_min_width(140);
+        }
+        gtk::prelude::TreeViewColumnExt::pack_start(&view, &cell, true);
+        gtk::prelude::TreeViewColumnExt::add_attribute(&view, &cell, "text", column);
+        tree.append_column(&view);
+    }
+    let scroll = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scroll.set_shadow_type(gtk::ShadowType::In);
+    scroll.set_min_content_height(160);
+    scroll.add(&tree);
+    page.pack_start(&scroll, true, true, 0);
+    let grid = gtk::Grid::new();
+    grid.set_column_spacing(8);
+    grid.set_row_spacing(6);
+    let name = gtk::Entry::new();
+    let query = gtk::Entry::new();
+    query.set_placeholder_text(Some("A search, e.g. ext:psd;xcf or dm:today pic:"));
+    for (row, label, entry) in [(0, "Name:", &name), (1, "Search:", &query)] {
+        grid.attach(&caption(label), 0, row, 1, 1);
+        entry.set_hexpand(true);
+        grid.attach(entry, 1, row, 1, 1);
+    }
+    grid.set_sensitive(false);
+    page.pack_start(&grid, false, false, 0);
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let add = gtk::Button::with_label("Add");
+    let remove = gtk::Button::with_label("Remove");
+    buttons.pack_start(&add, false, false, 0);
+    buttons.pack_start(&remove, false, false, 0);
+    page.pack_start(&buttons, false, false, 0);
+    let loading = Rc::new(Cell::new(false));
+    let selected_row = |tree: &gtk::TreeView| chosen(tree);
+    // Writes the list back into the draft from the store (the store is the
+    // editing state; the draft is what Apply saves).
+    let commit: Rc<dyn Fn()> = {
+        let store = store.clone();
+        let draft = draft.clone();
+        let set = set.clone();
+        Rc::new(move || {
+            let mut pairs = Vec::new();
+            if let Some(iter) = store.iter_first() {
+                loop {
+                    let name = store.value(&iter, 0).get::<String>().unwrap_or_default();
+                    let query = store.value(&iter, 1).get::<String>().unwrap_or_default();
+                    pairs.push((name, query));
+                    if !store.iter_next(&iter) {
+                        break;
+                    }
+                }
+            }
+            set(&mut draft.borrow_mut(), pairs);
+        })
+    };
+    {
+        let store = store.clone();
+        let grid = grid.clone();
+        let name = name.clone();
+        let query = query.clone();
+        let loading = loading.clone();
+        tree.selection().connect_changed(move |s| {
+            loading.set(true);
+            match s.selected() {
+                Some((_, iter)) => {
+                    grid.set_sensitive(true);
+                    name.set_text(&store.value(&iter, 0).get::<String>().unwrap_or_default());
+                    query.set_text(&store.value(&iter, 1).get::<String>().unwrap_or_default());
+                }
+                None => {
+                    grid.set_sensitive(false);
+                    name.set_text("");
+                    query.set_text("");
+                }
+            }
+            loading.set(false);
+        });
+    }
+    for (entry, column) in [(&name, 0_u32), (&query, 1)] {
+        let store = store.clone();
+        let tree = tree.clone();
+        let loading = loading.clone();
+        let commit = commit.clone();
+        entry.connect_changed(move |e| {
+            if loading.get() {
+                return;
+            }
+            if let Some((_, iter)) = tree.selection().selected() {
+                store.set_value(&iter, column, &e.text().to_string().to_value());
+                commit();
+            }
+        });
+    }
+    {
+        let store = store.clone();
+        let tree = tree.clone();
+        let name_entry = name.clone();
+        let new_name = new_name.to_owned();
+        let commit = commit.clone();
+        add.connect_clicked(move |_| {
+            let iter = store.insert_with_values(None, &[(0, &new_name), (1, &"")]);
+            tree.selection().select_iter(&iter);
+            commit();
+            name_entry.grab_focus();
+            name_entry.select_region(0, -1);
+        });
+    }
+    {
+        let tree = tree.clone();
+        remove.connect_clicked(move |_| {
+            if selected_row(&tree).is_some()
+                && let Some((_, iter)) = tree.selection().selected()
+            {
+                store.remove(&iter);
+                commit();
+            }
+        });
+    }
+    let _ = get;
+    page
 }
 fn page() -> gtk::Box {
     let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -198,7 +395,10 @@ fn folders(dialog: &gtk::Dialog, draft: Rc<RefCell<Settings>>, error: gtk::Label
     let enabled = gtk::CheckButton::with_label("Include this folder in the index");
     let recursive = gtk::CheckButton::with_label("Include subfolders");
     let monitor = gtk::CheckButton::with_label("Monitor changes");
-    for button in [&enabled, &recursive, &monitor] {
+    let keep = gtk::CheckButton::with_label(
+        "Keep its files in the index while it is unavailable (unplugged drive, unmounted share)",
+    );
+    for button in [&enabled, &recursive, &monitor, &keep] {
         policy.pack_start(button, false, false, 0);
     }
     let schedule = gtk::ComboBoxText::new();
@@ -233,6 +433,18 @@ fn folders(dialog: &gtk::Dialog, draft: Rc<RefCell<Settings>>, error: gtk::Label
     }
     policy.pack_start(&timing, false, false, 0);
     page.pack_start(&policy, false, false, 0);
+    let network_hint = caption("");
+    network_hint.set_no_show_all(true);
+    page.pack_start(&network_hint, false, false, 0);
+    let removable = gtk::CheckButton::with_label(
+        "Index removable drives when they are plugged in (their files stay searchable while unplugged)",
+    );
+    removable.set_active(draft.borrow().index.removable_drives);
+    {
+        let d = draft.clone();
+        removable.connect_toggled(move |b| d.borrow_mut().index.removable_drives = b.is_active());
+    }
+    page.pack_start(&removable, false, false, 4);
     page.pack_start(&caption("Folder changes take effect when you choose Apply or OK. Removing a folder never deletes its files."),false,false,0);
     let selected = Rc::new(Cell::new(None::<usize>));
     let loading = Rc::new(Cell::new(false));
@@ -245,10 +457,12 @@ fn folders(dialog: &gtk::Dialog, draft: Rc<RefCell<Settings>>, error: gtk::Label
         let enabled = enabled.clone();
         let recursive = recursive.clone();
         let monitor = monitor.clone();
+        let keep = keep.clone();
         let schedule = schedule.clone();
         let interval = interval.clone();
         let hour = hour.clone();
         let minute = minute.clone();
+        let network_hint = network_hint.clone();
         tree.selection().connect_changed(move |s| {
             loading.set(true);
             let index = s
@@ -259,9 +473,19 @@ fn folders(dialog: &gtk::Dialog, draft: Rc<RefCell<Settings>>, error: gtk::Label
             selected.set(index);
             if let Some(r) = index.and_then(|i| draft.borrow().index.roots.get(i).cloned()) {
                 policy.set_sensitive(true);
+                match crate::mounts::network_fs(&r.path.path()) {
+                    Some(fs) => {
+                        network_hint.set_text(&format!(
+                            "Network folder ({fs}): changes made by other computers are only found by the scheduled rescan, so a short interval is recommended."
+                        ));
+                        network_hint.show();
+                    }
+                    None => network_hint.hide(),
+                }
                 enabled.set_active(r.enabled);
                 recursive.set_active(r.recursive);
                 monitor.set_active(r.monitor);
+                keep.set_active(r.keep_offline);
                 match r.schedule {
                     Schedule::Interval { seconds } => {
                         schedule.set_active_id(Some("interval"));
@@ -282,7 +506,7 @@ fn folders(dialog: &gtk::Dialog, draft: Rc<RefCell<Settings>>, error: gtk::Label
             loading.set(false);
         });
     }
-    for (button, field) in [(enabled, 0), (recursive, 1), (monitor, 2)] {
+    for (button, field) in [(enabled, 0), (recursive, 1), (monitor, 2), (keep, 3)] {
         let draft = draft.clone();
         let selected = selected.clone();
         let loading = loading.clone();
@@ -294,7 +518,8 @@ fn folders(dialog: &gtk::Dialog, draft: Rc<RefCell<Settings>>, error: gtk::Label
                 match field {
                     0 => root.enabled = b.is_active(),
                     1 => root.recursive = b.is_active(),
-                    _ => root.monitor = b.is_active(),
+                    2 => root.monitor = b.is_active(),
+                    _ => root.keep_offline = b.is_active(),
                 }
             }
         });
@@ -352,7 +577,7 @@ fn folders(dialog: &gtk::Dialog, draft: Rc<RefCell<Settings>>, error: gtk::Label
                 let mut config = draft.borrow_mut();
                 for path in paths {
                     if !config.index.roots.iter().any(|r| r.path.path() == path) {
-                        config.index.roots.push(RootConfig::new(&path));
+                        config.index.roots.push(RootConfig::for_folder(&path));
                     }
                 }
                 fill_roots(&store, &config);
@@ -646,6 +871,14 @@ fn search(draft: Rc<RefCell<Settings>>) -> gtk::Box {
         let d = draft.clone();
         delay.connect_value_changed(move |s| d.borrow_mut().ui.search_delay_ms = s.value() as u64);
     }
+    let history =
+        gtk::CheckButton::with_label("Keep a history of searches (Search → Recent Searches)");
+    history.set_active(draft.borrow().ui.history_enabled);
+    {
+        let d = draft.clone();
+        history.connect_toggled(move |b| d.borrow_mut().ui.history_enabled = b.is_active());
+    }
+    page.pack_start(&history, false, false, 6);
     let empty = gtk::CheckButton::with_label("Show no results until you type a search");
     empty.set_active(draft.borrow().ui.hide_results_until_search);
     empty.set_tooltip_text(Some(

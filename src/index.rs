@@ -53,8 +53,15 @@ pub struct Entry {
     pub path: Box<[u8]>,
     name_start: u32,
     pub kind: Kind,
+    /// File size; for a folder, the total size of the indexed files inside.
     pub size: u64,
     pub modified: i64,
+    /// Creation time (seconds), or `table::NO_DATE` when unknown.
+    #[serde(default = "no_date")]
+    pub created: i64,
+}
+fn no_date() -> i64 {
+    crate::table::NO_DATE
 }
 impl Entry {
     pub fn new(path: Vec<u8>, kind: Kind, size: u64, modified: i64) -> Self {
@@ -72,7 +79,12 @@ impl Entry {
             kind,
             size,
             modified,
+            created: crate::table::NO_DATE,
         }
+    }
+    pub fn created(mut self, created: i64) -> Self {
+        self.created = created;
+        self
     }
     pub fn name(&self) -> &[u8] {
         &self.path[self.name_start as usize..]
@@ -84,7 +96,8 @@ impl Entry {
             kind_of(&m),
             m.len(),
             m.mtime(),
-        ))
+        )
+        .created(created_of(&m)))
     }
     pub fn path_buf(&self) -> PathBuf {
         PathBuf::from(std::ffi::OsString::from_vec(self.path.to_vec()))
@@ -95,6 +108,13 @@ impl Entry {
     pub fn display_name(&self) -> String {
         String::from_utf8_lossy(self.name()).into_owned()
     }
+}
+/// Creation time from statx, where the filesystem records one.
+fn created_of(m: &fs::Metadata) -> i64 {
+    m.created()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(crate::table::NO_DATE, |d| d.as_secs() as i64)
 }
 fn kind_of(m: &fs::Metadata) -> Kind {
     if m.is_dir() {
@@ -207,7 +227,7 @@ pub fn scan_config(
     progress: &dyn Fn(usize),
 ) -> Result<Option<Snapshot>> {
     scan_config_watched(
-        config, data_dir, generation, targets, cancel, progress, None,
+        config, data_dir, generation, targets, None, cancel, progress, None,
     )
 }
 
@@ -215,11 +235,32 @@ pub fn scan_config(
 /// folder is read, so changes during the scan are not missed.
 pub type WatchHook<'a> = Option<&'a dyn Fn(&Path)>;
 
+/// Whether a root folder is unavailable: missing, or an empty directory
+/// (an unmounted mount point). Only meaningful for roots that keep their
+/// entries while offline.
+pub fn is_offline(path: &Path) -> bool {
+    match fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(_) => true,
+    }
+}
+/// Enabled roots that keep their entries and are unavailable right now.
+pub fn offline_roots(config: &crate::config::IndexConfig) -> Vec<String> {
+    config
+        .roots
+        .iter()
+        .filter(|r| r.enabled && r.keep_offline && is_offline(&r.path.path()))
+        .map(|r| r.path.display())
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)] // scan inputs plus three callbacks
 pub fn scan_config_watched(
     config: &crate::config::IndexConfig,
     data_dir: &Path,
     generation: u64,
     targets: Option<&[PathBuf]>,
+    previous: Option<&Table>,
     cancel: &dyn Fn() -> bool,
     progress: &dyn Fn(usize),
     watch: WatchHook,
@@ -232,6 +273,7 @@ pub fn scan_config_watched(
         config,
         data_dir,
         targets,
+        previous,
         &mut builder,
         &mut ScanLog {
             errors: &mut errors,
@@ -274,6 +316,7 @@ pub fn scan_into(
     config: &crate::config::IndexConfig,
     data_dir: &Path,
     targets: Option<&[PathBuf]>,
+    previous: Option<&Table>,
     builder: &mut Builder,
     log: &mut ScanLog,
     cancel: &dyn Fn() -> bool,
@@ -294,6 +337,19 @@ pub fn scan_into(
                 .collect(),
         };
         paths.sort_by(|a, b| path_cmp(a.as_os_str().as_bytes(), b.as_os_str().as_bytes()));
+        // An unplugged drive or unmounted share: keep what was indexed.
+        if root_config.keep_offline
+            && is_offline(&root)
+            && let Some(previous) = previous
+        {
+            for path in paths {
+                let bytes = path.as_os_str().as_bytes();
+                let start = previous.lower_bound(bytes);
+                let end = previous.subtree_end(start, bytes);
+                builder.copy_range(previous, start, end);
+            }
+            continue;
+        }
         for path in paths {
             let depth = path
                 .strip_prefix(&root)
@@ -341,11 +397,12 @@ pub fn scan_into(
                             watch(item.path());
                         }
                         if (kind == Kind::Folder || rules.include_file(item.path(), &root))
-                            && !builder.push(
+                            && !builder.push_with(
                                 item.path().as_os_str().as_bytes(),
                                 kind,
                                 m.len(),
                                 m.mtime(),
+                                created_of(&m),
                             )
                         {
                             record_error(

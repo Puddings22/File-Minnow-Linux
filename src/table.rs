@@ -15,10 +15,17 @@ pub(crate) type Parts<'a> = (&'a [u8], &'a Dirs, &'a [Row]);
 /// Parent index of entries whose path has no parent, such as `/`.
 pub const NO_DIR: u32 = u32::MAX;
 
+/// Unknown creation time (the filesystem does not record one).
+pub const NO_DATE: i64 = i64::MIN;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Row {
+    /// File size, or for a folder the total size of the indexed files
+    /// inside it (computed by the builder).
     pub size: u64,
     pub modified: i64,
+    /// Creation time, or `NO_DATE`.
+    pub created: i64,
     name_offset: u32,
     pub dir: u32,
     name_len: u16,
@@ -70,6 +77,32 @@ pub struct Table {
     dirs: Dirs,
     rows: Vec<Row>,
     name_order: OnceLock<Vec<u32>>,
+    folded: OnceLock<Folded>,
+}
+
+/// Folded forms (see `fold`) of the names that contain non-ASCII bytes,
+/// stored back to back like the names buffer, with the row of each.
+#[derive(Clone, Debug, Default)]
+pub struct Folded {
+    pub bytes: Vec<u8>,
+    pub ends: Vec<u32>,
+    pub rows: Vec<u32>,
+}
+impl Folded {
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+    pub fn range(&self, k: usize) -> (usize, usize) {
+        let start = if k == 0 { 0 } else { self.ends[k - 1] as usize };
+        (start, self.ends[k] as usize)
+    }
+    pub fn get(&self, k: usize) -> &[u8] {
+        let (start, end) = self.range(k);
+        &self.bytes[start..end]
+    }
 }
 
 /// Component-wise byte order: `/` sorts before every other byte, so a folder's
@@ -138,7 +171,40 @@ impl Table {
     }
     pub fn entry(&self, i: usize) -> Entry {
         let row = &self.rows[i];
-        Entry::new(self.path(i), row.kind, row.size, row.modified)
+        Entry::new(self.path(i), row.kind, row.size, row.modified).created(row.created)
+    }
+    /// Whether folder row `i` has no indexed entries inside it.
+    pub fn is_empty_folder(&self, i: usize) -> bool {
+        self.rows[i].kind == Kind::Folder
+            && match self.rows.get(i + 1) {
+                None => true,
+                Some(next) => {
+                    let mut path = Vec::new();
+                    self.write_path(i, &mut path);
+                    next.dir == NO_DIR || self.dirs.get(next.dir as usize) != path.as_slice()
+                }
+            }
+    }
+    /// For each parent folder path (by `dir` id), the row of that folder, or
+    /// `u32::MAX` when the folder itself is not indexed (a root's parent).
+    pub fn dir_rows(&self) -> Vec<u32> {
+        let mut dir_rows = vec![u32::MAX; self.dirs.len()];
+        let mut path = Vec::new();
+        for j in 1..self.rows.len() {
+            let dir = self.rows[j].dir;
+            // The first child follows its folder directly in path order, so
+            // only that child needs the comparison.
+            if dir != NO_DIR
+                && dir_rows[dir as usize] == u32::MAX
+                && self.rows[j - 1].kind == Kind::Folder
+            {
+                self.write_path(j - 1, &mut path);
+                if self.dirs.get(dir as usize) == path.as_slice() {
+                    dir_rows[dir as usize] = (j - 1) as u32;
+                }
+            }
+        }
+        dir_rows
     }
     /// Materializes every entry. Intended for tests and small tools only.
     pub fn entries(&self) -> Vec<Entry> {
@@ -151,6 +217,7 @@ impl Table {
             kind: self.rows[index].kind,
             size: self.rows[index].size,
             modified: self.rows[index].modified,
+            created: self.rows[index].created,
         })
     }
     pub fn from_entries(mut entries: Vec<Entry>) -> Self {
@@ -158,7 +225,7 @@ impl Table {
         entries.dedup_by(|a, b| a.path == b.path);
         let mut builder = Builder::with_capacity(entries.len());
         for e in &entries {
-            builder.push(&e.path, e.kind, e.size, e.modified);
+            builder.push_with(&e.path, e.kind, e.size, e.modified, e.created);
         }
         builder.finish()
     }
@@ -168,6 +235,9 @@ impl Table {
             + self.rows.capacity() * std::mem::size_of::<Row>()
             + self.dirs.heap_bytes()
             + self.name_order.get().map_or(0, |o| o.capacity() * 4)
+            + self.folded.get().map_or(0, |f| {
+                f.bytes.capacity() + f.ends.capacity() * 4 + f.rows.capacity() * 4
+            })
     }
     /// First row whose path is not before `path` in component order.
     pub fn lower_bound(&self, path: &[u8]) -> usize {
@@ -234,6 +304,23 @@ impl Table {
             order
         })
     }
+    /// Folded names of the rows whose names are not plain ASCII. Built once
+    /// per table on first use; ASCII names need no folded copy because the
+    /// scanner compares them case-insensitively as they are.
+    pub fn folded(&self) -> &Folded {
+        self.folded.get_or_init(|| {
+            let mut folded = Folded::default();
+            for i in 0..self.rows.len() {
+                let name = self.name(i);
+                if !name.is_ascii() {
+                    folded.bytes.extend(crate::fold::fold(name));
+                    folded.ends.push(folded.bytes.len() as u32);
+                    folded.rows.push(i as u32);
+                }
+            }
+            folded
+        })
+    }
     /// The name order, if a search has already built it.
     pub fn name_order_if_built(&self) -> Option<&[u32]> {
         self.name_order.get().map(Vec::as_slice)
@@ -296,6 +383,7 @@ impl Table {
             dirs,
             rows,
             name_order: OnceLock::new(),
+            folded: OnceLock::new(),
         }
     }
 }
@@ -307,6 +395,7 @@ impl Row {
     pub(crate) fn from_raw(
         size: u64,
         modified: i64,
+        created: i64,
         name_offset: u32,
         dir: u32,
         name_len: u16,
@@ -315,6 +404,7 @@ impl Row {
         Self {
             size,
             modified,
+            created,
             name_offset,
             dir,
             name_len,
@@ -330,6 +420,7 @@ pub struct EntryRef<'a> {
     pub kind: Kind,
     pub size: u64,
     pub modified: i64,
+    pub created: i64,
 }
 impl EntryRef<'_> {
     pub fn name(&self) -> &[u8] {
@@ -395,6 +486,16 @@ impl Builder {
     /// Returns false when the name is too long to store (over 65535 bytes,
     /// far beyond Linux's 255-byte limit) or the buffer would overflow.
     pub fn push(&mut self, path: &[u8], kind: Kind, size: u64, modified: i64) -> bool {
+        self.push_with(path, kind, size, modified, NO_DATE)
+    }
+    pub fn push_with(
+        &mut self,
+        path: &[u8],
+        kind: Kind,
+        size: u64,
+        modified: i64,
+        created: i64,
+    ) -> bool {
         let (dir, name) = split(path);
         if name.len() > u16::MAX as usize || self.names.len() + name.len() > u32::MAX as usize {
             return false;
@@ -408,6 +509,7 @@ impl Builder {
         self.rows.push(Row {
             size,
             modified,
+            created,
             name_offset,
             dir,
             name_len: name.len() as u16,
@@ -462,7 +564,66 @@ impl Builder {
         self.names.shrink_to_fit();
         self.rows.shrink_to_fit();
         self.dirs.shrink_to_fit();
-        Table::from_parts(self.names, self.dirs, self.rows)
+        let mut table = Table::from_parts(self.names, self.dirs, self.rows);
+        table.sum_folder_sizes();
+        table
+    }
+}
+
+impl Table {
+    /// Sets every folder row's size to the total size of the files inside
+    /// it. One pass in path order with a stack of open folders; a folder's
+    /// total is passed up to its parent when the walk leaves it. Rows with
+    /// the same parent are siblings, so the ancestry check runs once per
+    /// run of siblings, not once per row.
+    fn sum_folder_sizes(&mut self) {
+        // (row, path, total)
+        let mut open: Vec<(usize, Vec<u8>, u64)> = Vec::new();
+        let mut current_dir = u32::MAX - 1;
+        let mut dir_path: Vec<u8> = Vec::new();
+        let close = |open: &mut Vec<(usize, Vec<u8>, u64)>, rows: &mut [Row]| {
+            if let Some((row, _, total)) = open.pop() {
+                rows[row].size = total;
+                if let Some(parent) = open.last_mut() {
+                    parent.2 += total;
+                }
+            }
+        };
+        for i in 0..self.rows.len() {
+            let row = self.rows[i];
+            if row.dir != current_dir {
+                current_dir = row.dir;
+                dir_path.clear();
+                if row.dir != NO_DIR {
+                    dir_path.extend_from_slice(self.dirs.get(row.dir as usize));
+                }
+                while open
+                    .last()
+                    .is_some_and(|(_, path, _)| row.dir == NO_DIR || !within(&dir_path, path))
+                {
+                    close(&mut open, &mut self.rows);
+                }
+            }
+            match row.kind {
+                Kind::Folder => {
+                    let mut path = Vec::new();
+                    self.write_path(i, &mut path);
+                    open.push((i, path, 0));
+                    // The next row is either this folder's first child or a
+                    // later sibling: check again even if its parent id is the same.
+                    current_dir = u32::MAX - 1;
+                }
+                Kind::File => {
+                    if let Some(parent) = open.last_mut() {
+                        parent.2 += row.size;
+                    }
+                }
+                _ => {}
+            }
+        }
+        while !open.is_empty() {
+            close(&mut open, &mut self.rows);
+        }
     }
 }
 
@@ -476,6 +637,41 @@ mod tests {
                 .map(|p| Entry::new(p.as_bytes().to_vec(), Kind::File, 1, 2))
                 .collect(),
         )
+    }
+    #[test]
+    fn folder_sizes_empty_folders_and_dir_rows() {
+        let entry = |path: &str, kind, size| Entry::new(path.as_bytes().to_vec(), kind, size, 0);
+        let t = Table::from_entries(vec![
+            entry("/d", Kind::Folder, 4096),
+            entry("/d/a.txt", Kind::File, 10),
+            entry("/d/sub", Kind::Folder, 4096),
+            entry("/d/sub/b.txt", Kind::File, 100),
+            entry("/d/sub/deep", Kind::Folder, 4096),
+            entry("/d/sub/deep/c.txt", Kind::File, 1000),
+            entry("/d/sub/link", Kind::Link, 5),
+            entry("/d/zed", Kind::Folder, 4096),
+            entry("/d/zz.txt", Kind::File, 20),
+            entry("/e", Kind::Folder, 4096),
+            entry("/e/x.txt", Kind::File, 7),
+        ]);
+        let size_of = |path: &[u8]| t.row(t.lower_bound(path)).size;
+        assert_eq!(size_of(b"/d"), 1130);
+        assert_eq!(size_of(b"/d/sub"), 1100);
+        assert_eq!(size_of(b"/d/sub/deep"), 1000);
+        assert_eq!(size_of(b"/d/zed"), 0);
+        assert_eq!(size_of(b"/e"), 7);
+        assert!(t.is_empty_folder(t.lower_bound(b"/d/zed")));
+        assert!(!t.is_empty_folder(t.lower_bound(b"/d/sub")));
+        assert!(!t.is_empty_folder(t.lower_bound(b"/d/a.txt")));
+        let dir_rows = t.dir_rows();
+        let dir_of = |path: &[u8]| t.row(t.lower_bound(path)).dir as usize;
+        assert_eq!(
+            dir_rows[dir_of(b"/d/sub/b.txt")] as usize,
+            t.lower_bound(b"/d/sub")
+        );
+        assert_eq!(dir_rows[dir_of(b"/e/x.txt")] as usize, t.lower_bound(b"/e"));
+        assert_eq!(dir_rows[dir_of(b"/d")], u32::MAX, "/ is not indexed");
+        assert_eq!(t.entry(1).created, NO_DATE);
     }
     #[test]
     fn component_order_keeps_subtrees_contiguous() {

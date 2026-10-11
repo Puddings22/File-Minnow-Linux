@@ -16,11 +16,27 @@ while no window is open; the window attaches to it automatically.
 
 ## The window
 
-- **Columns.** Name, Path, Size, Modified and Type. Click a header to sort and click again
-  to reverse. Type sorting puts folders first, then groups files by extension.
-  Column widths, sort order, window size and position are remembered.
+- **Columns.** Name, Path, Size, Modified, Type and Created (hidden until you switch it on
+  in the **View** menu). Click a header to sort and click again to reverse. Type sorting
+  puts folders first, then groups files by extension. Folders show the total size of the
+  indexed files inside them. The creation date comes from the filesystem (ext4, Btrfs and
+  XFS record it; some network and FUSE filesystems do not, and the cell stays empty).
+  Column widths, visibility, sort order, window size and position are remembered.
+- **Highlighting.** The parts of a name that matched your search are shown in bold.
 - **Type filter.** The drop-down beside the search box limits results to Audio,
-  Compressed, Document, Folder, Picture or Video. It combines with what you type.
+  Compressed, Document, Folder, Picture or Video, followed by your own filters from
+  **Options → Filters**. It combines with what you type.
+- **Preview pane.** **View → Preview Pane** shows the selected picture (scaled to fit), the
+  start of a text file, or a summary for other files, on the right of the results.
+- **Bookmarks.** The **Bookmarks** menu runs a saved search; **Add Bookmark…** saves the
+  current one and **Organize Bookmarks…** edits the list.
+- **Search history.** Searches are remembered when you open a result or close the window,
+  complete the search box as you type, and are listed under **Search → Recent Searches**
+  (with **Clear Search History**). Switch it off in **Options → Search**.
+- **Export.** **File → Export Results…** writes every result of the current search to a
+  CSV file (name, path, size, dates, type) or a text file with one full path per line.
+- **Unavailable drives.** Entries of an unplugged drive or unmounted share are shown greyed
+  until it is back (see **Folders** below).
 - **Right-click menu.** Open, Open With (the applications your desktop offers for the type),
   Open Containing Folder (your file manager opens with the file selected), Open in
   Terminal, Cut, Copy, Copy Full Path, Copy Name, Rename, Move to Trash and Properties.
@@ -67,15 +83,29 @@ while no window is open; the window attaches to it automatically.
 | `file:` / `folder:` | Entry kind |
 | `path:/Projects` | Match the full path; a `/` in a term does the same |
 | `case:README` | Case-sensitive |
-| `size:>10mb`, `size:1kb..2mb` | File size (binary units) |
+| `size:>10mb`, `size:1kb..2mb` | File size (binary units); folders count the files inside them |
 | `dm:today`, `dm:2026-10-07`, `dm:>2026-01-01` | Date modified, local calendar days |
+| `dc:2026-10-07`, `dc:>=2026-01-01` | Date created (same forms as `dm:`) |
+| `wholeword:report`, `ww:report` | Whole words only (letters and digits around the match end it) |
+| `dupe:` | Names that occur more than once in the index (exact name) |
+| `empty:` | Folders with nothing indexed inside |
+| `parent:/home/alex/Documents`, `infolder:` | Entries directly inside a folder |
+| `child:README.md` | Folders that contain an entry with that name |
+| `content:invoice total` | Text inside files (see below) |
 | `regex:"^report.*\.pdf$"` | Rust regular expression |
 
 OR has higher precedence than the implicit AND. Quotes protect spaces and operators.
 Unknown modifiers are reported as errors; quote file names that contain a colon.
-Case-insensitive matching folds ASCII letters. Paths keep their exact bytes, so names that
-are not valid UTF-8 can still be opened even if they display with replacement
+
+Matching ignores case and accents: `stiinta` finds `Știință`, `ecole` finds `École` and
+`ÉCOLE`, and names saved in decomposed Unicode (as macOS writes them) match composed
+input. `case:` makes a term exact (bytes as typed). Paths keep their exact bytes, so names
+that are not valid UTF-8 can still be opened even if they display with replacement
 characters.
+
+`content:` reads every file left by the other terms (up to 16 MB each) and keeps those
+containing the text, ASCII case-insensitively. It is slow by nature, so give it a name
+term, a type filter or a folder to narrow the files first: `ext:txt content:total`.
 
 ## Options
 
@@ -84,14 +114,23 @@ Cancel discards them.
 
 - **Folders.** Add or remove folders, choose whether subfolders are included and
   whether the folder is monitored for live changes, and set a safety rescan schedule
-  (daily at a chosen time, every N minutes, or never). Daily at 03:00 is the default.
+  (daily at a chosen time, every N minutes, or never). Daily at 03:00 is the default;
+  folders on a network share (NFS, SMB, SSHFS…) get a 30-minute rescan instead, because
+  changes made by other computers do not reach inotify. **Keep its files in the index
+  while it is unavailable** keeps an unplugged drive or unmounted share searchable
+  (greyed) instead of dropping it. **Index removable drives when they are plugged in**
+  adds drives mounted under `/media` or `/run/media` automatically, with that option on.
 - **Exclusions.** Hidden files and folders, excluded folders, and include-only or exclude
   file patterns (one per line, case-sensitive).
 - **File Types.** A list of extensions that are left out of the index. The defaults are
   temporary files, partial downloads, editor swap files and compiler output. Add, remove
   or restore the defaults, or switch the list off.
-- **Search.** Search-as-you-type delay, and **Show no results until you type a search**: with
-  an empty search box the list stays empty (choosing a type filter still shows results).
+- **Filters.** Your own entries for the drop-down beside the search box: a name and a
+  search (for example `ext:psd;xcf` or `dm:today pic:`).
+- **Bookmarks.** The saved searches of the Bookmarks menu.
+- **Search.** Search-as-you-type delay, the search history, and **Show no results until you
+  type a search**: with an empty search box the list stays empty (choosing a type filter
+  still shows results).
 - **Keyboard.** Click the field (or press Enter on it) and press the combination for the
   global show/hide shortcut. Escape cancels recording and Backspace clears the shortcut.
   If nothing happens, your desktop already uses that combination. On Cinnamon, check
@@ -111,7 +150,16 @@ when it is closed. The daily safety rescan catches anything a watch could miss, 
 changes on network mounts or folders beyond the system's watch limit
 (`fs.inotify.max_user_watches`). Watch problems are shown in the status bar.
 
+Adding a folder indexes just that folder; the rest of the index is kept as it is.
 Pausing indexing keeps searches working against the current index; resuming catches up.
+
+## Searching from the file manager
+
+The package adds **Search Here with File Minnow** to the folder menu of Nemo (Cinnamon)
+and Dolphin (KDE). It runs `file-minnow show --in FOLDER`, which opens the window with the
+search scoped to that folder. For Thunar, add a custom action with that command, `%f`
+as the folder and "Directories" as the file type; for Nautilus, a script in
+`~/.local/share/nautilus/scripts` can call it with `$NAUTILUS_SCRIPT_CURRENT_URI`.
 
 ## Command line
 
@@ -124,12 +172,13 @@ file-minnow search invoice --live
 file-minnow status --live
 file-minnow pause | resume | rescan
 file-minnow show | toggle | quit
+file-minnow show --in /path/to/folder
 file-minnow paths
 ```
 
 `quit` closes the window and the indexer it owns; an independently started daemon keeps
 running (`stop` stops it). `--data-dir /path` keeps a separate index and settings.
-Search supports `--sort name|path|size|modified|type`, `--descending`, `--offset`,
+Search supports `--sort name|path|size|modified|type|created`, `--descending`, `--offset`,
 `--limit`, `--json` and `--null`; NUL-delimited output is safe for any file name.
 `file-minnow paths` prints where the index, settings and sockets are.
 

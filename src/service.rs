@@ -114,6 +114,7 @@ pub fn reconcile_watched(
                     config,
                     dir,
                     Some(&targets),
+                    Some(old),
                     &mut builder,
                     &mut log,
                     cancel,

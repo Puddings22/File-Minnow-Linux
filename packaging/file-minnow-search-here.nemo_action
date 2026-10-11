@@ -1,0 +1,8 @@
+[Nemo Action]
+Name=Search Here with File Minnow
+Comment=Find files inside this folder instantly
+Exec=file-minnow show --in %F
+Icon-Name=file-minnow
+Selection=s
+Extensions=dir;
+Quote=double
