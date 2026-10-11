@@ -90,7 +90,8 @@ Cancel discards them.
 - **File Types.** A list of extensions that are left out of the index. The defaults are
   temporary files, partial downloads, editor swap files and compiler output. Add, remove
   or restore the defaults, or switch the list off.
-- **Search.** Search-as-you-type delay and related preferences.
+- **Search.** Search-as-you-type delay, and **Show no results until you type a search**: with
+  an empty search box the list stays empty (choosing a type filter still shows results).
 - **Keyboard.** Click the field (or press Enter on it) and press the combination for the
   global show/hide shortcut. Escape cancels recording and Backspace clears the shortcut.
   If nothing happens, your desktop already uses that combination. On Cinnamon, check

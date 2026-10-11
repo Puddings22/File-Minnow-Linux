@@ -144,6 +144,11 @@ pub(crate) struct App {
     activate_on_map: Rc<Cell<bool>>,
     /// The right-click menu, rebuilt for each selection.
     context_menu: Option<gtk::Menu>,
+    /// The list is empty because nothing is searched yet
+    /// (`hide_results_until_search`).
+    waiting_for_search: bool,
+    /// The `hide_results_until_search` value the shown results follow.
+    hide_until_search: bool,
     /// The request whose results are displayed, and the one in flight; when
     /// they match, a refresh keeps the selection and scroll position.
     shown_key: Option<(String, Sort, bool, usize)>,
@@ -389,6 +394,8 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
         memory_timer: None,
         activate_on_map: Rc::new(Cell::new(false)),
         context_menu: None,
+        waiting_for_search: false,
+        hide_until_search: settings.ui.hide_results_until_search,
         shown_key: None,
         requested_key: (String::new(), Sort::Name, false, 0),
     }));
@@ -1313,6 +1320,21 @@ impl App {
             query.push_str(&filter);
         }
         self.requested_key = (query.clone(), self.sort, self.descending, self.offset);
+        // Nothing searched yet: show an empty list instead of everything,
+        // without running a search (the version bump above drops any
+        // search still in flight).
+        self.hide_until_search = self.backend.settings().ui.hide_results_until_search;
+        self.waiting_for_search = self.hide_until_search && query.trim().is_empty();
+        if self.waiting_for_search {
+            self.offset = 0;
+            self.replace_results(SearchResponse {
+                entries: Vec::new(),
+                total: 0,
+                generation: self.last_generation,
+                elapsed_ms: 0.,
+            });
+            return;
+        }
         let request = SearchRequest {
             query,
             sort: self.sort,
@@ -1348,7 +1370,9 @@ impl App {
         }
         self.integration.configure(&desktop);
         self.integration.set_paused(status.paused);
-        if status.generation != self.last_generation {
+        if status.generation != self.last_generation
+            || settings.ui.hide_results_until_search != self.hide_until_search
+        {
             self.last_generation = status.generation;
             self.schedule();
         }
@@ -1378,6 +1402,9 @@ impl App {
         } else if self.pending {
             self.spinner.start();
             self.status.set_text("Searching…");
+        } else if self.waiting_for_search && s.entries > 0 {
+            self.spinner.stop();
+            self.status.set_text("Type to search");
         } else {
             self.spinner.stop();
             self.status.set_text(if s.entries == 0 {
@@ -1400,7 +1427,9 @@ impl App {
         } else {
             self.status.set_tooltip_text(None);
         }
-        let counts = if let Some(r) = self.data.borrow().as_ref() {
+        let counts = if let Some(r) = self.data.borrow().as_ref()
+            && !self.waiting_for_search
+        {
             format!(
                 "{} indexed  |  {} {}  |  {:.1} ms",
                 count(s.entries),

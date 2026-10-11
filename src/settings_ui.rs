@@ -646,6 +646,16 @@ fn search(draft: Rc<RefCell<Settings>>) -> gtk::Box {
         let d = draft.clone();
         delay.connect_value_changed(move |s| d.borrow_mut().ui.search_delay_ms = s.value() as u64);
     }
+    let empty = gtk::CheckButton::with_label("Show no results until you type a search");
+    empty.set_active(draft.borrow().ui.hide_results_until_search);
+    empty.set_tooltip_text(Some(
+        "With an empty search box the result list stays empty. Choosing a type filter also counts as a search.",
+    ));
+    {
+        let d = draft.clone();
+        empty.connect_toggled(move |b| d.borrow_mut().ui.hide_results_until_search = b.is_active());
+    }
+    page.pack_start(&empty, false, false, 6);
     page.pack_start(&caption("Search is focused automatically whenever the window opens. Results update without fades, smooth-scroll effects or other transitions."),false,false,6);
     page.pack_start(&caption("Default matching ignores ASCII letter case. Use case: for case-sensitive matching, path: for paths, and < > to group terms. OR is evaluated before AND."),false,false,6);
     page

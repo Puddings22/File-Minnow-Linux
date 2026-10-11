@@ -338,7 +338,28 @@ try:
         subprocess.run(['import', '-quiet', '-window', window, str(output / 'type-filter.png')], env=env, check=True)
         choose_filter('Up', 'Up', 'Up')
         wait_window(lambda s: s['filter'] == '')
-        menu_checks = {'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
+        # Optional empty list until something is searched (user request).
+        def set_ui(**values):
+            current = request({'command': 'settings'})['settings']
+            current['ui'].update(values)
+            assert not request({'command': 'set_settings', 'settings': current})['error']
+        all_entries = request({'command': 'search', 'query': '', 'sort': 'Name', 'descending': False, 'limit': 10, 'offset': 0})['search']['total']
+        wait_window(lambda s: s['filter'] == '' and s['matches'] == all_entries)
+        set_ui(hide_results_until_search=True)
+        wait_window(lambda s: s['query'] == '' and s['matches'] == 0 and s['status_text'] == 'Type to search')
+        choose_filter('Down', 'Down', 'Down')  # a type filter is a search too
+        wait_window(lambda s: s['filter'] == 'doc:' and s['matches'] == 3)
+        choose_filter('Up', 'Up', 'Up')
+        wait_window(lambda s: s['filter'] == '' and s['matches'] == 0)
+        xdo('windowfocus', '--sync', window)
+        xdo('key', 'ctrl+l')
+        xdo('type', '--delay', '10', 'invoice')
+        wait_window(lambda s: s['query'] == 'invoice' and s['matches'] == 1)
+        xdo('key', 'ctrl+l', 'BackSpace')
+        wait_window(lambda s: s['query'] == '' and s['matches'] == 0)
+        set_ui(hide_results_until_search=False)
+        wait_window(lambda s: s['query'] == '' and s['matches'] == all_entries)
+        menu_checks = {'empty_until_search': True, 'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
         # Excluded file types: the default list hides *.tmp.
         assert request({'command': 'search', 'query': 'scratch', 'sort': 'Name', 'descending': False, 'limit': 10, 'offset': 0})['search']['total'] == 0, 'default file types were indexed'
         xdo('windowfocus', '--sync', window)

@@ -369,6 +369,9 @@ pub struct UiConfig {
     pub start_hidden: bool,
     pub global_shortcut: String,
     pub remember_search: bool,
+    /// Keep the result list empty until something is searched (a term or a
+    /// type filter), like Everything's "Hide results when search is empty".
+    pub hide_results_until_search: bool,
     pub history_enabled: bool,
     pub history_days: u32,
     pub history_limit: usize,
@@ -383,6 +386,7 @@ impl Default for UiConfig {
             start_hidden: false,
             global_shortcut: "Ctrl+Alt+Space".into(),
             remember_search: true,
+            hide_results_until_search: false,
             history_enabled: true,
             history_days: 90,
             history_limit: 200,
