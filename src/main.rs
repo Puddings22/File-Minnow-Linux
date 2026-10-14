@@ -271,9 +271,10 @@ fn main() -> Result<()> {
                         text.push('/');
                     }
                     let scoped = format!("\"{}\"", text.replace('"', ""));
+                    // A trailing space, so what the user types next is a new term.
                     Some(match query {
                         Some(q) if !q.trim().is_empty() => format!("{scoped} {q}"),
-                        _ => scoped,
+                        _ => format!("{scoped} "),
                     })
                 }
                 None => query,

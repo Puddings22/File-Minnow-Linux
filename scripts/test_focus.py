@@ -148,6 +148,12 @@ try:
         check('shortcut_from_hidden', lambda: xdo('key', xdotool_chord), True)
         check('shortcut_from_behind', lambda: xdo('key', xdotool_chord), False)
         check('second_launch_from_hidden', lambda: subprocess.run([binary, '--data-dir', str(cache), 'show'], env=env, timeout=10, capture_output=True), True)
+        # "Search Here" from a file manager: the folder stays in the box and
+        # what the user types is added after it, not typed over it.
+        scope = f'"{files.resolve()}/" '
+        check('search_here_from_hidden', lambda: subprocess.run([binary, '--data-dir', str(cache), 'show', '--in', str(files)], env=env, timeout=10, capture_output=True), True)
+        if results['search_here_from_hidden'] is True and window_state()['query'] != scope + 'sea':
+            results['search_here_from_hidden'] = f'FAILED: query became {window_state()["query"]!r}'
         # Escape closes (to the tray here).
         # The window comes back where it was hidden, not where the window
         # manager would place a new window.

@@ -1577,6 +1577,7 @@ impl App {
         state.tray_available = self.tray_available;
         state.hotkey_status = self.hotkey_status.clone();
         state.query = self.entry.text().into();
+        state.query_selected = self.entry.selection_bounds().is_some();
         state.filter = self.filter.active_id().unwrap_or_default().into();
         state.matches = self.data.borrow().as_ref().map(|r| r.total).unwrap_or(0);
         state.settings_open = self.options.as_ref().is_some_and(|o| o.dialog.is_visible());
@@ -1590,6 +1591,12 @@ impl App {
     fn focus_search(&mut self) {
         self.entry.grab_focus();
         self.entry.select_region(0, -1);
+    }
+    /// Focuses the search box with the cursor after the text, so typing
+    /// adds to it (a folder scope from a file manager's "Search Here").
+    fn focus_search_end(&mut self) {
+        self.entry.grab_focus();
+        self.entry.set_position(-1);
     }
     fn set_preview(&mut self, on: bool) {
         self.memory.preview = on;
@@ -1909,6 +1916,13 @@ impl App {
                 options.dialog.hide();
             }
             self.record_history();
+            // The next opening starts a new search; the old one is in the
+            // history. Cleared now so it never flashes when shown.
+            if self.backend.settings().ui.clear_search_on_open && !self.entry.text().is_empty() {
+                self.entry.set_text("");
+                self.offset = 0;
+                self.schedule();
+            }
             // Where the window is now is where it comes back (`show`).
             if self.window.is_visible() && !self.memory.maximized {
                 let (x, y) = self.window.position();
@@ -2272,7 +2286,8 @@ impl App {
                                         a.entry.set_text(&query);
                                         a.offset = 0;
                                         a.schedule();
-                                        a.focus_search();
+                                        a.focus_search_end();
+                                        a.publish();
                                     }
                                 }
                                 WindowAction::Toggle => {

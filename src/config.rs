@@ -389,7 +389,9 @@ pub struct UiConfig {
     pub close_to_tray: bool,
     pub start_hidden: bool,
     pub global_shortcut: String,
-    pub remember_search: bool,
+    /// Start with an empty search box each time the window opens from the
+    /// tray or the shortcut. Off: the last search stays, selected.
+    pub clear_search_on_open: bool,
     /// Keep the result list empty until something is searched (a term or a
     /// type filter), like Everything's "Hide results when search is empty".
     pub hide_results_until_search: bool,
@@ -415,7 +417,7 @@ impl Default for UiConfig {
             close_to_tray: true,
             start_hidden: false,
             global_shortcut: "Ctrl+Alt+Space".into(),
-            remember_search: true,
+            clear_search_on_open: true,
             hide_results_until_search: false,
             history_enabled: true,
             history_days: 90,

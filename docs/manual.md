@@ -128,9 +128,10 @@ Cancel discards them.
 - **Filters.** Your own entries for the drop-down beside the search box: a name and a
   search (for example `ext:psd;xcf` or `dm:today pic:`).
 - **Bookmarks.** The saved searches of the Bookmarks menu.
-- **Search.** Search-as-you-type delay, the search history, and **Show no results until you
-  type a search**: with an empty search box the list stays empty (choosing a type filter
-  still shows results).
+- **Search.** Search-as-you-type delay, the search history, **Show no results until you
+  type a search** (with an empty search box the list stays empty; choosing a type filter
+  still shows results), and **Start with an empty search each time the window opens**
+  (on by default). Turn it off to keep the last search, selected, so typing replaces it.
 - **Keyboard.** Click the field (or press Enter on it) and press the combination for the
   global show/hide shortcut. Escape cancels recording and Backspace clears the shortcut.
   If nothing happens, your desktop already uses that combination. On Cinnamon, check
@@ -157,7 +158,7 @@ Pausing indexing keeps searches working against the current index; resuming catc
 
 The package adds **Search Here with File Minnow** to the folder menu of Nemo (Cinnamon)
 and Dolphin (KDE). It runs `file-minnow show --in FOLDER`, which opens the window with the
-search scoped to that folder. For Thunar, add a custom action with that command, `%f`
+search scoped to that folder and the cursor after it, so what you type searches inside it. For Thunar, add a custom action with that command, `%f`
 as the folder and "Directories" as the file type; for Nautilus, a script in
 `~/.local/share/nautilus/scripts` can call it with `$NAUTILUS_SCRIPT_CURRENT_URI`.
 

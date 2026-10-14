@@ -452,11 +452,16 @@ try:
         subprocess.run(['import', '-quiet', '-window', window, str(output / 'preview.png')], env=env, check=True)
         # "Search here" from a file manager: show --in scopes the search to a folder.
         subprocess.run([binary, '--data-dir', str(cache), 'show', '--in', str(files)], env=env, check=True, timeout=10)
-        wait_window(lambda s: s['query'] == f'"{files.resolve()}/"' and s['matches'] == all_entries - 1)
+        scope = f'"{files.resolve()}/" '
+        wait_window(lambda s: s['query'] == scope and s['matches'] == all_entries - 1)
+        # The folder stays and the cursor is after it: typing adds a term.
+        assert not window_state()['query_selected'], 'Search Here left the folder selected'
         xdo('windowfocus', '--sync', window)
+        xdo('type', '--delay', '10', 'invoice')
+        wait_window(lambda s: s['query'] == scope + 'invoice' and s['matches'] == 1)
         xdo('key', 'ctrl+l', 'BackSpace')
         wait_window(lambda s: s['query'] == '')
-        menu_checks = {'bookmarks_menu': True, 'custom_filter': True, 'export_csv': True, 'view_menu_remembered': True, 'show_in_folder_scope': True, 'empty_until_search': True, 'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
+        menu_checks = {'bookmarks_menu': True, 'custom_filter': True, 'export_csv': True, 'view_menu_remembered': True, 'show_in_folder_scope': True, 'search_here_cursor_after_folder': True, 'empty_until_search': True, 'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
         # Excluded file types: the default list hides *.tmp.
         assert request({'command': 'search', 'query': 'scratch', 'sort': 'Name', 'descending': False, 'limit': 10, 'offset': 0})['search']['total'] == 0, 'default file types were indexed'
         xdo('windowfocus', '--sync', window)
@@ -552,7 +557,19 @@ try:
                 assert time.monotonic() < deadline, 'search history not recorded'
                 time.sleep(.1)
             window_state('show')
-            wait_window(lambda s: s['visible'])
+            # Each opening starts with an empty search (the default).
+            wait_window(lambda s: s['visible'] and s['query'] == '')
+            # With the option off, the last search stays, selected.
+            set_ui(clear_search_on_open=False)
+            xdo('windowfocus', '--sync', window)
+            xdo('key', 'ctrl+l')
+            xdo('type', '--delay', '10', 'notes')
+            wait_window(lambda s: s['query'] == 'notes')
+            window_state('hide')
+            wait_window(lambda s: not s['visible'])
+            window_state('show')
+            wait_window(lambda s: s['visible'] and s['query'] == 'notes' and s['query_selected'])
+            set_ui(clear_search_on_open=True)
             xdo('key', 'ctrl+l', 'BackSpace')
             wait_window(lambda s: s['query'] == '')
             history_recorded = True
@@ -622,7 +639,7 @@ try:
             app.wait(timeout=8)
             assert app.returncode == 0
             connection.close()
-            desktop_checks = {'search_history_recorded': history_recorded, 'tray_registration': True, 'tray_icon': True, 'tray_activation': True, 'tray_menu_pause': True, 'x11_shortcut_toggle': not args.portal, 'shortcut_portal_protocol': args.portal, 'native_wayland_rendering': False, 'close_to_tray': True, 'tray_disabled_restores_window': True, 'no_tray_close_quits': True}
+            desktop_checks = {'search_history_recorded': history_recorded, 'empty_search_on_open': history_recorded, 'tray_registration': True, 'tray_icon': True, 'tray_activation': True, 'tray_menu_pause': True, 'x11_shortcut_toggle': not args.portal, 'shortcut_portal_protocol': args.portal, 'native_wayland_rendering': False, 'close_to_tray': True, 'tray_disabled_restores_window': True, 'no_tray_close_quits': True}
         else:
             current = window_state()
             assert not current['tray_available']

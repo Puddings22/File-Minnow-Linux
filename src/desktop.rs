@@ -82,6 +82,9 @@ pub struct WindowState {
     pub tray_available: bool,
     pub hotkey_status: String,
     pub query: String,
+    /// Whether the search text is selected (typing replaces it).
+    #[serde(default)]
+    pub query_selected: bool,
     pub matches: usize,
     pub settings_open: bool,
     pub owns_index: bool,

@@ -894,6 +894,17 @@ fn search(draft: Rc<RefCell<Settings>>) -> gtk::Box {
         empty.connect_toggled(move |b| d.borrow_mut().ui.hide_results_until_search = b.is_active());
     }
     page.pack_start(&empty, false, false, 6);
+    let fresh =
+        gtk::CheckButton::with_label("Start with an empty search each time the window opens");
+    fresh.set_active(draft.borrow().ui.clear_search_on_open);
+    fresh.set_tooltip_text(Some(
+        "When off, the last search stays in the box, selected, so typing replaces it. Earlier searches are always in Search → Recent Searches.",
+    ));
+    {
+        let d = draft.clone();
+        fresh.connect_toggled(move |b| d.borrow_mut().ui.clear_search_on_open = b.is_active());
+    }
+    page.pack_start(&fresh, false, false, 6);
     page.pack_start(&caption("Search is focused automatically whenever the window opens. Results update without fades, smooth-scroll effects or other transitions."),false,false,6);
     page.pack_start(&caption("Default matching ignores ASCII letter case. Use case: for case-sensitive matching, path: for paths, and < > to group terms. OR is evaluated before AND."),false,false,6);
     page
