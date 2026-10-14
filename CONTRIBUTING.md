@@ -32,6 +32,11 @@ python3 scripts/test_focus.py --xvfb /path/to/Xvfb         # focus with Muffin a
 
 They need `xdotool`, `xclip`, ImageMagick's `import`, and Python with `dbus` and `gi`.
 
+After changing the icon (`packaging/file-minnow.svg`), run `python3 scripts/render_icons.py`.
+It renders the PNG sizes the app embeds and the package installs, and updates the snap's
+copy. Keep the SVG to plain shapes and gradients: some renderers, such as store pages,
+drop elements that use SVG filters.
+
 ## Principles
 
 - **Speed and resource use come first.** The GUI is event-driven: no timers, polling or
