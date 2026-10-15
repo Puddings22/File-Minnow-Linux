@@ -563,8 +563,9 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
                 .get::<String>()
                 .unwrap_or_default()
                 .to_lowercase();
+            // Ctrl+Space asks for operators, filters and bookmarks only.
             if model.value(iter, 2).get::<i32>().unwrap_or(0) == 0 {
-                return !key.is_empty() && text.starts_with(key) && text != key;
+                return !asked.get() && !key.is_empty() && text.starts_with(key) && text != key;
             }
             let word = key.rsplit(char::is_whitespace).next().unwrap_or("");
             if let Some(wanted) = word.strip_prefix(':') {
