@@ -527,7 +527,7 @@ try:
         # View menu: Preview Pane on, Items and Created columns on; all remembered.
         xdo('windowfocus', '--sync', window)
         xdo('mousemove', '--window', window, '150', '107', 'click', '1')
-        for keys in [['End'], ['End', 'Up'], ['End', 'Up', 'Up']]:
+        for keys in [['End', 'Up'], ['End', 'Up', 'Up'], ['End', 'Up', 'Up', 'Up']]:
             xdo('key', 'alt+v')
             time.sleep(.4)
             xdo('key', *keys, 'Return')
@@ -541,6 +541,35 @@ try:
             assert time.monotonic() < deadline, f'view settings not saved: {saved}'
             time.sleep(.1)
         subprocess.run(['import', '-quiet', '-window', window, str(output / 'preview.png')], env=env, check=True)
+        # View > Thumbnails: the grid, with a thumbnail made and saved in the
+        # (private) standard thumbnail cache.
+        import gi
+        gi.require_version('GdkPixbuf', '2.0')
+        from gi.repository import GdkPixbuf
+        picture = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, 320, 200)
+        picture.fill(0x2266aaff)
+        picture.savev(str(files / 'holiday.png'), 'png', [], [])
+        xdo('windowfocus', '--sync', window)
+        xdo('key', 'ctrl+l')
+        xdo('type', '--delay', '10', 'holiday')
+        wait_window(lambda s: s['query'] == 'holiday' and s['matches'] == 1)
+        xdo('key', 'alt+v')
+        time.sleep(.4)
+        xdo('key', 'End', 'Return')
+        thumbnails = Path(os.environ['XDG_CACHE_HOME']) / 'thumbnails' / 'normal'
+        deadline = time.monotonic() + 10
+        while not thumbnails.exists() or not any(thumbnails.iterdir()):
+            assert time.monotonic() < deadline, 'no thumbnail was made for the grid'
+            time.sleep(.1)
+        time.sleep(.5)
+        subprocess.run(['import', '-quiet', '-window', window, str(output / 'thumbnails.png')], env=env, check=True)
+        xdo('key', 'alt+v')
+        time.sleep(.4)
+        xdo('key', 'End', 'Return')
+        (files / 'holiday.png').unlink()
+        xdo('key', 'ctrl+l')
+        xdo('type', '--delay', '10', 'pdf')
+        wait_window(lambda s: s['query'] == 'pdf' and s['matches'] == 2)
         # "Search here" from a file manager: show --in scopes the search to a folder.
         subprocess.run([binary, '--data-dir', str(cache), 'show', '--in', str(files)], env=env, check=True, timeout=10)
         scope = f'"{files.resolve()}/" '

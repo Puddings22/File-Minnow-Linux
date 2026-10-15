@@ -50,6 +50,9 @@ struct WindowMemory {
     /// Saved after the Items column existed; older states get it hidden.
     #[serde(default)]
     knows_items: bool,
+    /// Results shown as thumbnails (View > Thumbnails).
+    #[serde(default)]
+    thumbnails: bool,
 }
 fn default_hidden() -> Vec<String> {
     vec!["Created".into(), "Items".into()]
@@ -70,6 +73,7 @@ impl Default for WindowMemory {
             preview: false,
             preview_width: 320,
             knows_items: true,
+            thumbnails: false,
         }
     }
 }
@@ -143,7 +147,20 @@ pub(crate) enum Message {
     Trashed(Vec<PathBuf>, String),
     /// An undo finished: its summary or error, and the step to keep if it failed.
     Undone(Result<String, String>),
+    /// A thumbnail for the grid: its generation, result index and pixels.
+    Thumbnail(u64, u32, PreviewContent),
 }
+/// A thumbnail the grid asks for.
+struct ThumbJob {
+    generation: u64,
+    index: u32,
+    path: PathBuf,
+    mime: String,
+}
+/// Requests for thumbnails, newest last; one background thread serves them.
+type ThumbQueue = Arc<(Mutex<Vec<ThumbJob>>, std::sync::Condvar)>;
+/// Pixel size of grid thumbnails.
+const GRID_SIZE: i32 = 128;
 pub(crate) enum PreviewContent {
     /// Decoded, already scaled pixels (RGB or RGBA, 8 bits per sample).
     Image {
@@ -332,6 +349,17 @@ pub(crate) struct App {
     browse_back: Vec<String>,
     /// Tools > Recent Changes, while it is open.
     changes: Option<Rc<crate::changes_ui::ChangesWindow>>,
+    /// The thumbnail grid (View > Thumbnails), its model (picture, name,
+    /// result index) and the stack holding it and the list.
+    grid: gtk::IconView,
+    grid_scroller: gtk::ScrolledWindow,
+    results: gtk::Stack,
+    /// Set while the grid's selection is copied to the list.
+    grid_syncing: Rc<Cell<bool>>,
+    /// Increased each time the grid is filled; older thumbnails are dropped.
+    grid_generation: Arc<AtomicU64>,
+    grid_requested: Vec<bool>,
+    thumb_queue: ThumbQueue,
 }
 impl Drop for App {
     fn drop(&mut self) {
@@ -616,9 +644,25 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
     scroller.set_kinetic_scrolling(false);
     scroller.set_overlay_scrolling(false);
     scroller.add(&tree);
+    let grid = gtk::IconView::new();
+    grid.set_selection_mode(gtk::SelectionMode::Multiple);
+    grid.set_item_width(GRID_SIZE + 24);
+    grid.set_row_spacing(4);
+    grid.set_column_spacing(4);
+    gtk::prelude::IconViewExt::set_margin(&grid, 6);
+    let grid_scroller =
+        gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    grid_scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    grid_scroller.set_shadow_type(gtk::ShadowType::In);
+    grid_scroller.set_kinetic_scrolling(false);
+    grid_scroller.set_overlay_scrolling(false);
+    grid_scroller.add(&grid);
+    let results = gtk::Stack::new();
+    results.add_named(&scroller, "list");
+    results.add_named(&grid_scroller, "grid");
     // Results on the left, the optional preview pane on the right.
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
-    paned.pack1(&scroller, true, false);
+    paned.pack1(&results, true, false);
     let preview = PreviewPane::new();
     paned.pack2(&preview.frame, false, true);
     layout.pack_start(&paned, true, true, 0);
@@ -671,6 +715,43 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
             }
         }
     });
+    // Thumbnails for the grid, most recently asked for first.
+    let thumb_queue: ThumbQueue = Arc::default();
+    let grid_generation = Arc::new(AtomicU64::new(0));
+    {
+        let (queue, generation, sender) = (
+            thumb_queue.clone(),
+            grid_generation.clone(),
+            messages.clone(),
+        );
+        std::thread::spawn(move || {
+            loop {
+                let job = {
+                    let (jobs, ready) = &*queue;
+                    let mut jobs = jobs.lock().unwrap();
+                    loop {
+                        if let Some(job) = jobs.pop() {
+                            break job;
+                        }
+                        jobs = ready.wait(jobs).unwrap();
+                    }
+                };
+                if job.generation != generation.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let picture =
+                    crate::thumbnails::thumbnail(&job.path, &job.mime, GRID_SIZE, thumbnailers())
+                        .and_then(|p| image_content(&p));
+                if let Some(content) = picture
+                    && sender
+                        .send_blocking(Message::Thumbnail(job.generation, job.index, content))
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
     let app = Rc::new(RefCell::new(App {
         _session: session,
         backend,
@@ -739,6 +820,13 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
         undo_item: gtk::MenuItem::with_mnemonic("_Undo"),
         browse_back: Vec::new(),
         changes: None,
+        grid,
+        grid_scroller,
+        results,
+        grid_syncing: Rc::default(),
+        grid_generation,
+        grid_requested: Vec::new(),
+        thumb_queue,
     }));
     let weak = Rc::downgrade(&app);
     build_columns(&app);
@@ -767,6 +855,15 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
     entry.connect_key_press_event(move |_, event| {
         if event.keyval() == gdk::keys::constants::Down {
             with_app(&target, |a| {
+                if a.memory.thumbnails {
+                    a.grid.grab_focus();
+                    if a.grid.selected_items().is_empty() {
+                        let first = gtk::TreePath::from_indicesv(&[0]);
+                        a.grid.select_path(&first);
+                        a.grid.set_cursor(&first, None::<&gtk::CellRenderer>, false);
+                    }
+                    return;
+                }
                 a.tree.grab_focus();
                 if a.tree.selection().selected_rows().0.is_empty() {
                     a.tree.set_cursor(
@@ -877,6 +974,9 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
         a.integration.configure(&settings.ui);
         a.window.show_all();
         a.pager.hide();
+        if a.memory.thumbnails {
+            a.results.set_visible_child_name("grid");
+        }
         a.entry.set_text(launch.query.as_deref().unwrap_or(""));
         a.refresh_completion();
         a.focus_search();
@@ -1197,9 +1297,16 @@ fn x11_id(window: &gtk::Window) -> Option<u32> {
 /// Selects every result. The selection handler updates the app, so the app
 /// must not be borrowed while the selection changes.
 fn select_all(w: &AppWeak) {
-    let tree = w.upgrade().map(|a| a.borrow().tree.clone());
-    if let Some(tree) = tree {
-        tree.selection().select_all();
+    let widgets = w.upgrade().map(|a| {
+        let a = a.borrow();
+        (a.tree.clone(), a.grid.clone(), a.memory.thumbnails)
+    });
+    if let Some((tree, grid, thumbnails)) = widgets {
+        if thumbnails {
+            grid.select_all();
+        } else {
+            tree.selection().select_all();
+        }
     }
 }
 fn item(menu: &gtk::Menu, label: &str, action: impl Fn() + 'static) {
@@ -1257,6 +1364,13 @@ fn build_menus(app: &AppRef, bar: &gtk::MenuBar) {
                     with_app(&t, |a| a.set_preview(c.is_active()));
                 });
                 menu.append(&preview);
+                let thumbnails = gtk::CheckMenuItem::with_mnemonic("_Thumbnails");
+                thumbnails.set_active(WindowMemory::load(&app.borrow().memory_path).thumbnails);
+                let t = w.clone();
+                thumbnails.connect_toggled(move |c| {
+                    with_app(&t, |a| a.set_thumbnails(c.is_active()));
+                });
+                menu.append(&thumbnails);
             }
             "_File" => {
                 let t = w.clone();
@@ -1429,12 +1543,16 @@ fn build_menus(app: &AppRef, bar: &gtk::MenuBar) {
         }
     }
 }
-fn connect_results(app: &AppRef) {
-    let tree = app.borrow().tree.clone();
-    // Results drag out as files: to a file manager (copy or move), the
-    // desktop, a browser's upload field or a mail. Set before the press
-    // handler below, which keeps a multiple selection while it is dragged.
-    tree.drag_source_set(
+/// Results drag out as files: to a file manager (copy or move), the
+/// desktop, a browser's upload field or a mail. Set before the press
+/// handlers, which keep a multiple selection while it is dragged; a drag
+/// that starts clears `pending` (the narrowing on release).
+fn drag_out<T: Clone + 'static>(
+    widget: &gtk::Widget,
+    app: &AppRef,
+    pending: Rc<RefCell<Option<T>>>,
+) {
+    widget.drag_source_set(
         gdk::ModifierType::BUTTON1_MASK,
         &[
             gtk::TargetEntry::new("text/uri-list", gtk::TargetFlags::OTHER_APP, 0),
@@ -1442,13 +1560,9 @@ fn connect_results(app: &AppRef) {
         ],
         gdk::DragAction::COPY | gdk::DragAction::MOVE | gdk::DragAction::LINK,
     );
-    // A press on an already selected row of a multiple selection: the
-    // selection is kept for a drag, and narrowed to that row on release.
-    let pending: Rc<RefCell<Option<gtk::TreePath>>> = Rc::default();
     let w = Rc::downgrade(app);
-    let dragging = pending.clone();
-    tree.connect_drag_begin(move |_, context| {
-        dragging.replace(None);
+    widget.connect_drag_begin(move |_, context| {
+        pending.replace(None);
         with_app(&w, |a| {
             let icon: gio::Icon = match a.selected_items().first() {
                 Some(item) if item.folder => gio::ThemedIcon::new("folder").upcast(),
@@ -1459,7 +1573,7 @@ fn connect_results(app: &AppRef) {
         });
     });
     let w = Rc::downgrade(app);
-    tree.connect_drag_data_get(move |_, _, data, info, _| {
+    widget.connect_drag_data_get(move |_, _, data, info, _| {
         with_app(&w, |a| {
             let paths = a.selected_paths();
             if info == 0 {
@@ -1477,6 +1591,40 @@ fn connect_results(app: &AppRef) {
             }
         })
     });
+}
+/// Keys of the result list and the thumbnail grid.
+fn result_key(w: &AppWeak, e: &gdk::EventKey) -> glib::Propagation {
+    use gdk::keys::constants as key;
+    let mods = e.state()
+        & (gdk::ModifierType::CONTROL_MASK
+            | gdk::ModifierType::MOD1_MASK
+            | gdk::ModifierType::SHIFT_MASK);
+    let ctrl = mods == gdk::ModifierType::CONTROL_MASK;
+    match e.keyval() {
+        key::c | key::C if ctrl => with_app(w, |a| a.clipboard(false)),
+        key::x | key::X if ctrl => with_app(w, |a| a.clipboard(true)),
+        key::a | key::A if ctrl => select_all(w),
+        key::z | key::Z if ctrl => with_app(w, App::undo),
+        key::BackSpace if mods.is_empty() => with_app(w, App::browse_up),
+        key::Up if mods == gdk::ModifierType::MOD1_MASK => with_app(w, App::browse_up),
+        key::Left if mods == gdk::ModifierType::MOD1_MASK => with_app(w, App::browse_previous),
+        key::Delete | key::KP_Delete if mods.is_empty() => with_app(w, App::trash_selected),
+        key::F2 if mods.is_empty() => with_app(w, App::rename_selected),
+        key::Return | key::KP_Enter if mods == gdk::ModifierType::MOD1_MASK => {
+            with_app(w, App::properties)
+        }
+        key::Menu => popup(w, None),
+        key::F10 if mods == gdk::ModifierType::SHIFT_MASK => popup(w, None),
+        _ => return glib::Propagation::Proceed,
+    }
+    glib::Propagation::Stop
+}
+fn connect_results(app: &AppRef) {
+    let tree = app.borrow().tree.clone();
+    // A press on an already selected row of a multiple selection: the
+    // selection is kept for a drag, and narrowed to that row on release.
+    let pending: Rc<RefCell<Option<gtk::TreePath>>> = Rc::default();
+    drag_out(tree.upcast_ref(), app, pending.clone());
     let narrowing = pending.clone();
     let release_selection = tree.selection();
     tree.connect_button_release_event(move |tree, e| {
@@ -1499,32 +1647,7 @@ fn connect_results(app: &AppRef) {
         })
     });
     let w = Rc::downgrade(app);
-    tree.connect_key_press_event(move |_, e| {
-        use gdk::keys::constants as key;
-        let mods = e.state()
-            & (gdk::ModifierType::CONTROL_MASK
-                | gdk::ModifierType::MOD1_MASK
-                | gdk::ModifierType::SHIFT_MASK);
-        let ctrl = mods == gdk::ModifierType::CONTROL_MASK;
-        match e.keyval() {
-            key::c | key::C if ctrl => with_app(&w, |a| a.clipboard(false)),
-            key::x | key::X if ctrl => with_app(&w, |a| a.clipboard(true)),
-            key::a | key::A if ctrl => select_all(&w),
-            key::z | key::Z if ctrl => with_app(&w, App::undo),
-            key::BackSpace if mods.is_empty() => with_app(&w, App::browse_up),
-            key::Up if mods == gdk::ModifierType::MOD1_MASK => with_app(&w, App::browse_up),
-            key::Left if mods == gdk::ModifierType::MOD1_MASK => with_app(&w, App::browse_previous),
-            key::Delete | key::KP_Delete if mods.is_empty() => with_app(&w, App::trash_selected),
-            key::F2 if mods.is_empty() => with_app(&w, App::rename_selected),
-            key::Return | key::KP_Enter if mods == gdk::ModifierType::MOD1_MASK => {
-                with_app(&w, App::properties)
-            }
-            key::Menu => popup(&w, None),
-            key::F10 if mods == gdk::ModifierType::SHIFT_MASK => popup(&w, None),
-            _ => return glib::Propagation::Proceed,
-        }
-        glib::Propagation::Stop
-    });
+    tree.connect_key_press_event(move |_, e| result_key(&w, e));
     let selection = tree.selection();
     let w = Rc::downgrade(app);
     tree.connect_button_press_event(move |tree, e| {
@@ -1555,6 +1678,86 @@ fn connect_results(app: &AppRef) {
         } else {
             glib::Propagation::Proceed
         }
+    });
+    connect_grid(app);
+}
+/// The thumbnail grid shows the same results; its selection is copied to
+/// the list's, which every action reads.
+fn connect_grid(app: &AppRef) {
+    let (grid, tree, syncing) = {
+        let a = app.borrow();
+        (a.grid.clone(), a.tree.clone(), a.grid_syncing.clone())
+    };
+    let pending: Rc<RefCell<Option<gtk::TreePath>>> = Rc::default();
+    drag_out(grid.upcast_ref(), app, pending.clone());
+    {
+        let (tree, syncing) = (tree.clone(), syncing.clone());
+        grid.connect_selection_changed(move |grid| {
+            if syncing.replace(true) {
+                return;
+            }
+            let selection = tree.selection();
+            selection.unselect_all();
+            for path in grid.selected_items() {
+                selection.select_path(&path);
+            }
+            syncing.set(false);
+        });
+    }
+    let w = Rc::downgrade(app);
+    grid.connect_item_activated(move |_, _| with_app(&w, |a| a.open_selected(false)));
+    let w = Rc::downgrade(app);
+    grid.connect_key_press_event(move |_, e| result_key(&w, e));
+    let narrowing = pending.clone();
+    grid.connect_button_release_event(move |grid, e| {
+        if e.button() == 1
+            && let Some(path) = narrowing.take()
+        {
+            grid.unselect_all();
+            grid.select_path(&path);
+            grid.set_cursor(&path, None::<&gtk::CellRenderer>, false);
+        }
+        glib::Propagation::Proceed
+    });
+    let w = Rc::downgrade(app);
+    grid.connect_button_press_event(move |grid, e| {
+        let (x, y) = e.position();
+        let path = grid.path_at_pos(x as i32, y as i32);
+        let modified = e
+            .state()
+            .intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK);
+        if e.button() == 1 && e.event_type() == gdk::EventType::ButtonPress && !modified {
+            if let Some(path) = path
+                && grid.path_is_selected(&path)
+                && grid.selected_items().len() > 1
+            {
+                grid.grab_focus();
+                pending.replace(Some(path));
+                return glib::Propagation::Stop;
+            }
+            return glib::Propagation::Proceed;
+        }
+        if e.button() == 3 {
+            if let Some(path) = path
+                && !grid.path_is_selected(&path)
+            {
+                grid.unselect_all();
+                grid.select_path(&path);
+            }
+            popup(&w, Some(e));
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    let w = Rc::downgrade(app);
+    let scroller = app.borrow().grid_scroller.clone();
+    scroller
+        .vadjustment()
+        .connect_value_changed(move |_| with_app(&w, App::request_thumbnails));
+    let w = Rc::downgrade(app);
+    grid.connect_size_allocate(move |_, _| {
+        let w = w.clone();
+        glib::idle_add_local_once(move || with_app(&w, App::request_thumbnails));
     });
 }
 /// Adds a menu item with an optional shortcut hint (the shortcut itself is
@@ -1863,6 +2066,104 @@ impl App {
             self.preview.frame.hide();
         }
         self.remember();
+    }
+    fn set_thumbnails(&mut self, on: bool) {
+        self.memory.thumbnails = on;
+        self.results
+            .set_visible_child_name(if on { "grid" } else { "list" });
+        if on {
+            self.fill_grid();
+        } else {
+            self.grid.set_model(None::<&gtk::TreeModel>);
+            self.grid_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        self.remember();
+    }
+    /// Shows the current results in the grid: file type icons at once,
+    /// thumbnails as they are made for the items on screen.
+    fn fill_grid(&mut self) {
+        self.grid_generation.fetch_add(1, Ordering::Relaxed);
+        self.thumb_queue.0.lock().unwrap().clear();
+        let store = gtk::ListStore::new(&[
+            gtk::gdk_pixbuf::Pixbuf::static_type(),
+            String::static_type(),
+            u32::static_type(),
+        ]);
+        let theme = gtk::IconTheme::default();
+        let mut icons: std::collections::HashMap<String, Option<gtk::gdk_pixbuf::Pixbuf>> =
+            std::collections::HashMap::new();
+        let data = self.data.borrow();
+        let entries = data.as_ref().map(|r| r.entries.as_slice()).unwrap_or(&[]);
+        for (i, e) in entries.iter().enumerate() {
+            let key = match e.kind {
+                Kind::Folder => "inode/directory".to_owned(),
+                _ => file_ops::guess_type(&e.path_buf()).0.to_string(),
+            };
+            let icon = icons
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    let gicon: gio::Icon = if key == "inode/directory" {
+                        gio::ThemedIcon::new("folder").upcast()
+                    } else {
+                        gio::content_type_get_icon(&key)
+                    };
+                    theme.as_ref().and_then(|t| {
+                        t.lookup_by_gicon(&gicon, GRID_SIZE / 2, gtk::IconLookupFlags::FORCE_SIZE)
+                            .and_then(|info| info.load_icon().ok())
+                    })
+                })
+                .clone();
+            store.insert_with_values(
+                None,
+                &[(0, &icon), (1, &e.display_name()), (2, &(i as u32))],
+            );
+        }
+        drop(data);
+        self.grid_requested = vec![false; store.iter_n_children(None) as usize];
+        self.grid.set_model(Some(&store));
+        self.grid.set_pixbuf_column(0);
+        self.grid.set_text_column(1);
+        // The list's selection (kept across live updates) shows in the grid.
+        self.grid_syncing.set(true);
+        for path in self.tree.selection().selected_rows().0 {
+            self.grid.select_path(&path);
+        }
+        self.grid_syncing.set(false);
+        self.request_thumbnails();
+    }
+    /// Asks for thumbnails of the items on screen and a little beyond.
+    fn request_thumbnails(&mut self) {
+        if !self.memory.thumbnails {
+            return;
+        }
+        let Some((first, last)) = self.grid.visible_range() else {
+            return;
+        };
+        let index = |p: &gtk::TreePath| p.indices().first().copied().unwrap_or(0).max(0) as usize;
+        let (first, last) = (index(&first).saturating_sub(24), index(&last) + 48);
+        let generation = self.grid_generation.load(Ordering::Relaxed);
+        let data = self.data.borrow();
+        let entries = data.as_ref().map(|r| r.entries.as_slice()).unwrap_or(&[]);
+        let mut jobs = Vec::new();
+        for i in (first..=last.min(entries.len().saturating_sub(1))).rev() {
+            if self.grid_requested.get(i) != Some(&false) || entries[i].kind != Kind::File {
+                continue;
+            }
+            self.grid_requested[i] = true;
+            let path = entries[i].path_buf();
+            let mime = file_ops::guess_type(&path).0.to_string();
+            jobs.push(ThumbJob {
+                generation,
+                index: i as u32,
+                path,
+                mime,
+            });
+        }
+        if !jobs.is_empty() {
+            let (queue, ready) = &*self.thumb_queue;
+            queue.lock().unwrap().extend(jobs);
+            ready.notify_one();
+        }
     }
     /// Loads the preview shortly after the selection settles.
     fn schedule_preview(&mut self) {
@@ -2518,6 +2819,9 @@ impl App {
         } else {
             adjustment.set_value(0.);
         }
+        if self.memory.thumbnails {
+            self.fill_grid();
+        }
         self.pager.set_visible(total > 10_000);
         self.previous.set_sensitive(self.offset > 0);
         self.next.set_sensitive(self.offset + length < total);
@@ -2529,6 +2833,9 @@ impl App {
         ));
         self.pending = false;
         self.update_status();
+        // The selection changed with the model; the app was busy, so the
+        // selection handler could not refresh the preview.
+        self.schedule_preview();
     }
     fn apply_theme(&self, settings: &Settings) {
         if let Some(gtk) = gtk::Settings::default() {
@@ -2689,6 +2996,34 @@ impl App {
                 app.borrow_mut().set_search(&query);
             }
             Message::LoadPreview => app.borrow_mut().load_preview(),
+            Message::Thumbnail(generation, index, content) => {
+                let a = app.borrow();
+                if generation == a.grid_generation.load(Ordering::Relaxed)
+                    && let PreviewContent::Image {
+                        bytes,
+                        width,
+                        height,
+                        stride,
+                        alpha,
+                    } = content
+                    && let Some(store) = a
+                        .grid
+                        .model()
+                        .and_then(|m| m.downcast::<gtk::ListStore>().ok())
+                    && let Some(iter) = store.iter_nth_child(None, index as i32)
+                {
+                    let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_bytes(
+                        &bytes,
+                        gtk::gdk_pixbuf::Colorspace::Rgb,
+                        alpha,
+                        8,
+                        width,
+                        height,
+                        stride,
+                    );
+                    store.set_value(&iter, 0, &pixbuf.to_value());
+                }
+            }
             Message::Renamed(outcome) => {
                 let mut a = app.borrow_mut();
                 let count = outcome.done.len();
@@ -3305,22 +3640,14 @@ fn preview_content(entry: &Entry, max_width: i32, max_height: i32) -> Option<Pre
     }
     let path = entry.path_buf();
     let (kind, _) = file_ops::guess_type(&path);
-    if kind.starts_with("image/") && entry.size <= IMAGE_BYTES {
-        let pixbuf =
+    if kind.starts_with("image/")
+        && entry.size <= IMAGE_BYTES
+        && let Some(pixbuf) =
             gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(&path, max_width, max_height, true)
-                .ok()?
-                .apply_embedded_orientation()?;
-        if pixbuf.bits_per_sample() != 8 || pixbuf.colorspace() != gtk::gdk_pixbuf::Colorspace::Rgb
-        {
-            return None;
-        }
-        return Some(PreviewContent::Image {
-            bytes: pixbuf.read_pixel_bytes(),
-            width: pixbuf.width(),
-            height: pixbuf.height(),
-            stride: pixbuf.rowstride(),
-            alpha: pixbuf.has_alpha(),
-        });
+                .ok()
+                .and_then(|p| p.apply_embedded_orientation())
+    {
+        return image_content(&pixbuf);
     }
     if gio::content_type_is_a(&kind, "text/plain") || kind == "application/json" {
         use std::io::Read;
@@ -3339,7 +3666,30 @@ fn preview_content(entry: &Entry, max_width: i32, max_height: i32) -> Option<Pre
         }
         return Some(PreviewContent::Text(text));
     }
-    None
+    // Videos, documents, fonts and pictures GTK cannot decode: the
+    // desktop's thumbnail.
+    let size = max_width.min(max_height).clamp(128, 256);
+    let thumbnail = crate::thumbnails::thumbnail(&path, &kind, size, thumbnailers())?;
+    image_content(&thumbnail)
+}
+/// The desktop's thumbnailers, read once.
+fn thumbnailers() -> &'static crate::thumbnails::Thumbnailers {
+    static THUMBNAILERS: std::sync::OnceLock<crate::thumbnails::Thumbnailers> =
+        std::sync::OnceLock::new();
+    THUMBNAILERS.get_or_init(crate::thumbnails::Thumbnailers::load)
+}
+/// Pixels of an 8-bit RGB(A) picture, to send to the main thread.
+fn image_content(pixbuf: &gtk::gdk_pixbuf::Pixbuf) -> Option<PreviewContent> {
+    if pixbuf.bits_per_sample() != 8 || pixbuf.colorspace() != gtk::gdk_pixbuf::Colorspace::Rgb {
+        return None;
+    }
+    Some(PreviewContent::Image {
+        bytes: pixbuf.read_pixel_bytes(),
+        width: pixbuf.width(),
+        height: pixbuf.height(),
+        stride: pixbuf.rowstride(),
+        alpha: pixbuf.has_alpha(),
+    })
 }
 /// Fetches all results page by page and writes them; returns the count.
 fn export_results(

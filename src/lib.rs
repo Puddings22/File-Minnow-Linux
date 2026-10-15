@@ -28,5 +28,7 @@ pub mod shortcuts;
 pub mod store;
 pub mod table;
 #[cfg(feature = "gui")]
+pub mod thumbnails;
+#[cfg(feature = "gui")]
 pub mod ui;
 pub mod watch;
