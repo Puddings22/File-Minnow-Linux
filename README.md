@@ -18,27 +18,39 @@ File Minnow is built for exactly that.
   10–50 ms. Results update on every keystroke.
 - **Real-time index.** New, renamed and deleted files appear in the open results within
   a fraction of a second (Linux inotify). There is no hourly `updatedb` and no stale results.
+  At start-up only the folders that changed since the last run are read again.
 - **Light on resources.** About 100 MB of memory for a 1.6-million-file index. It uses
   **0 % CPU when idle**, has no animations, and never polls in the background.
 - **Familiar search syntax.** `AND`, `|` (OR), `!` (NOT), wildcards, `ext:`, `size:`,
-  `dm:` / `dc:` (date modified / created), `path:`, `regex:`, `dupe:`, `empty:`,
-  `wholeword:`, `parent:`, `child:`, `content:` and type filters like `pic:` and `doc:`.
+  `dm:` / `dc:` (date modified / created, with `thisweek`, `lastmonth`, `last7days`…),
+  `path:`, `regex:`, `dupe:` (by name, size or contents), `empty:`, `wholeword:`,
+  `parent:`, `child:`, `content:` and type filters like `pic:` and `doc:`. Type `:` in the
+  search box for a list.
 - **Accent- and case-insensitive.** Typing `stiinta` finds `Știință`, `ecole` finds `École`.
 - **Native desktop app.** It follows your GTK theme, fonts and file icons. Matches are
-  highlighted; columns (name, path, size, modified, type, created) sort and can be hidden;
-  folders show the total size of what is inside them; an optional preview pane shows
-  pictures and text files.
+  highlighted; columns (name, path, size, modified, type, created, items) sort naturally
+  and can be hidden; folders show the total size and number of what is inside them; a
+  thumbnail grid and an optional preview pane show pictures, videos and documents.
 - **Saved searches.** Bookmarks, search history with completion, your own filters in the
   drop-down beside the search box, and export of results to CSV or text.
 - **Drives and shares.** Removable drives can be indexed when plugged in and stay
   searchable (greyed) while unplugged. Network folders are recognised and rescanned on a
-  schedule. Adding a folder indexes only that folder.
+  schedule. Adding a folder indexes only that folder. Snapshot folders (Timeshift,
+  Snapper, ZFS) are skipped. Everything file lists (`.efu`) can be exported and indexed,
+  for example a list made nightly on a NAS.
 - **The right-click menu you expect.** Open, Open With, Open Containing Folder, Open in
-  Terminal, Cut/Copy (paste straight into your file manager), Rename, Move to Trash and
-  Properties. It also shows your file manager's custom actions (Nemo actions, Thunar
-  custom actions, Dolphin service menus, Nautilus and Caja scripts).
+  Terminal, Cut/Copy (paste straight into your file manager), Rename (several files at
+  once, with a preview), Move to Trash, Exclude from Index and Properties, with Undo. It
+  also shows your file manager's custom actions (Nemo actions, Thunar custom actions,
+  Dolphin service menus, Nautilus and Caja scripts). Drag results to a file manager, the
+  desktop or a browser.
+- **Recent changes.** A history of what was created, deleted, changed, moved or renamed in
+  your folders, including what changed while File Minnow was not running.
 - **Global hotkey and tray icon.** Press your shortcut from anywhere and start typing.
   X11 is supported, and Wayland through the GlobalShortcuts portal.
+- **Part of your desktop.** Results also appear in GNOME's Activities search and KDE's
+  KRunner, and "Search Here with File Minnow" can be added to the folder menu of GNOME
+  Files, Nemo, Caja, Thunar and Dolphin.
 - **Built for keyboard use.** Escape hides the window, Enter opens a file, F2 renames,
   Delete moves to the trash, and Ctrl+C copies the file.
 - **Private and local.** No root, no network and no telemetry. It indexes only the
@@ -131,8 +143,9 @@ packaging, desktop integration, autostart and the optional background service.
 | `case:README` | case-sensitive |
 | `size:>100mb`, `size:1kb..2mb` | file size; folders count the files inside them |
 | `dm:today`, `dm:2026-10-07`, `dm:>2026-01-01` | date modified (local time); `dc:` for date created |
+| `dm:thisweek`, `dm:lastmonth`, `dm:2026`, `dm:last7days` | calendar periods, years, months, and periods up to now |
 | `wholeword:report`, `ww:report` | whole words only |
-| `dupe:` | names that occur more than once |
+| `dupe:`, `dupe:size`, `dupe:content` | results sharing a name, a size or their contents with another result |
 | `empty:` | empty folders |
 | `parent:/home/alex/Documents` | directly inside a folder (no subfolders) |
 | `child:README.md` | folders that contain an entry with that name |
@@ -150,14 +163,16 @@ More in the [user manual](docs/manual.md).
 | ↓ / ↑ | Move into and through the results |
 | Enter / Alt+Enter | Open / Properties |
 | Ctrl+C / Ctrl+X | Copy / cut the selected files (paste in your file manager) |
-| F2 / Delete | Rename / move to trash |
+| F2 / Delete | Rename (several at once) / move to trash |
+| Ctrl+Z | Undo a rename or a move to the Trash |
 | Shift+F10 or Menu | Right-click menu |
 | Ctrl+, | Options |
 | F5 | Rescan |
 | Escape | Hide the window (to the tray) |
 
 In Nemo and Dolphin, right-click a folder → **Search Here with File Minnow** opens the
-window scoped to that folder (`file-minnow show --in FOLDER` from scripts).
+window scoped to that folder (`file-minnow show --in FOLDER` from scripts). Add it to
+GNOME Files, Caja or Thunar in **Options → Interface**.
 
 ## Everything vs. File Minnow: FAQ
 

@@ -28,6 +28,7 @@ python3 scripts/test_ui.py --xvfb /path/to/Xvfb --tray     # tray, global shortc
 python3 scripts/test_ui.py --xvfb /path/to/Xvfb --tray --portal --daemon-first
 python3 scripts/test_ui.py --xvfb /path/to/Xvfb --confined  # as a snap: portals for open, show, trash
 python3 scripts/test_focus.py --xvfb /path/to/Xvfb         # focus with Muffin as window manager
+python3 scripts/test_search_provider.py                     # GNOME Shell and KRunner search over D-Bus
 ```
 
 They need `xdotool`, `xclip`, ImageMagick's `import`, and Python with `dbus` and `gi`.

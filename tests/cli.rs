@@ -53,9 +53,21 @@ fn cli_and_daemon_end_to_end() {
         .unwrap();
     assert!(output.status.success());
     let records = file_minnow::efu::read(&output.stdout, &root).unwrap();
-    assert_eq!(records.len(), 3, "the folder and both files, whatever --limit says");
-    assert!(records.iter().any(|r| r.path.ends_with("/invoice.pdf") && r.size == 7));
-    assert!(records.iter().any(|r| r.folder && r.path == root.display().to_string()));
+    assert_eq!(
+        records.len(),
+        3,
+        "the folder and both files, whatever --limit says"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r.path.ends_with("/invoice.pdf") && r.size == 7)
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r.folder && r.path == root.display().to_string())
+    );
     let _daemon = Daemon(
         Command::new(bin)
             .arg("--data-dir")

@@ -16,13 +16,33 @@ folders. Average path length is 175 bytes, with many deep source and build trees
 | Index memory | 100 MB (about 63 bytes per entry) |
 | Index file on disk | 95 MB |
 | Loading the saved index at startup | 74 ms |
-| Building the name order (first search only) | 120 ms |
+| Building the name order (first search only) | 120 ms (byte order, 0.8) |
 | Full scan of the folder (cold walk) | 9–21 s, about 120 MB peak |
 | Re-indexing one changed folder | 55–85 ms, in the background |
+
+Since 0.9, names sort naturally (case- and accent-insensitive, numbers by value). On a
+later copy of the same home folder (1.74 million entries, while the computer was in use),
+building that order took about 450 ms, against about 290 ms for the byte order in the
+same runs; it happens once per loaded index, at the first search sorted by name.
 
 Paths are stored once per folder and names share one buffer, so memory grows with the
 number of entries rather than with path length. File types excluded by default
 (temporary files, compiler output) make real indexes smaller still.
+
+## Start-up (0.9)
+
+From 0.9, start-up checks the saved index folder by folder and only reads folders whose
+modification time changed (see the manual). `examples/bench_startup.rs` compares that with
+a full walk, both adding the folder watches the app adds. On `/usr` (1.12 million entries
+in 106,000 folders, warm cache, three runs):
+
+| | |
+|---|---|
+| Full walk with watches | 7.1–7.3 s |
+| Start-up check with watches | 1.4 s |
+
+With a cold cache the difference should be larger, as the check reads one inode per
+folder instead of one per entry; that was not measured.
 
 ## Search (engine time, 1.6 million entries)
 
@@ -55,7 +75,7 @@ Measured with the full window on a virtual X server (software rendering) against
 | | |
 |---|---|
 | Searchable after launch (saved index) | 0.4 s |
-| Startup rescan finished | 9–19 s |
+| Startup rescan finished (0.8: full walk) | 9–19 s |
 | Folder watches | 102,000, no errors |
 | CPU while idle | 0.0 % |
 | Private memory while idle | about 171 MB (index about 100 MB, watch bookkeeping about 30 MB, GTK the rest) |
@@ -76,6 +96,8 @@ cargo run --release --no-default-features --example bench_index -- ~/.cache/file
 cargo run --release --no-default-features --example bench_search
 # Cost of re-indexing changed folders
 cargo run --release --no-default-features --example bench_update -- ~/.cache/file-minnow
+# Start-up: full walk versus the check of changed folders, on a folder you name
+cargo run --release --no-default-features --example bench_startup -- /usr
 # Indexing and idle cost on generated files (no GUI)
 python3 scripts/benchmark_io.py
 # Full desktop app on a private virtual X server (needs Xvfb)

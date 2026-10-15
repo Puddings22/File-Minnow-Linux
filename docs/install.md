@@ -96,6 +96,9 @@ A confined snap works differently from the package:
   are not offered, because a snap cannot start the computer's other programs. Properties
   shows File Minnow's own summary.
 - **Start at login** works as usual; snapd starts the app with your session.
+- Results in GNOME's overview and KRunner, and adding **Search Here** to file managers,
+  are not available: a snap cannot install them.
+- Thumbnails are made only for pictures, and kept in the snap's own cache.
 - The index is kept in `~/snap/file-minnow/common/.cache/file-minnow` and the settings in
   `~/snap/file-minnow/current/.config/file-minnow`, separate from a package install.
 
@@ -117,11 +120,29 @@ quits.
 ## File manager integration
 
 The package installs a **Search Here with File Minnow** entry for folders in Nemo
-(`/usr/share/nemo/actions`) and Dolphin (`/usr/share/kio/servicemenus`). For a per-user
-install, copy `packaging/file-minnow-search-here.nemo_action` to
-`~/.local/share/nemo/actions/` or `packaging/file-minnow-search-here.desktop` to
-`~/.local/share/kio/servicemenus/` (and make it executable). Thunar users can add a custom
-action running `file-minnow show --in %f` for directories.
+(`/usr/share/nemo/actions`) and Dolphin (`/usr/share/kio/servicemenus`). GNOME Files
+(Nautilus), Caja and Thunar keep such entries per user: add it for your account in
+**Options → Interface**, which also covers Nemo and Dolphin for a portable or per-user
+install. It writes a script to `~/.local/share/nautilus/scripts` or
+`~/.config/caja/scripts`, a custom action to `~/.config/Thunar/uca.xml` (keeping your
+other actions), or an action or service menu under `~/.local/share`, and removes it again
+from the same place.
+
+## Desktop search (GNOME Shell, KRunner)
+
+The package installs a GNOME Shell search provider
+(`/usr/share/gnome-shell/search-providers/org.fileminnow.FileMinnow.search-provider.ini`),
+a KRunner plugin (`/usr/share/krunner/dbusplugins/file-minnow.desktop`) and the D-Bus
+service that starts `file-minnow search-provider` when the desktop searches
+(`/usr/share/dbus-1/services/org.fileminnow.FileMinnow.SearchProvider.service`). Nothing
+runs until you search, and the provider exits a minute after the last search. Turn the
+results off in GNOME Settings → Search or in KDE's KRunner settings.
+
+GNOME Shell reads search providers only from the system data folders, so a per-user
+install cannot offer them there. KRunner and D-Bus also read per-user folders: copy
+`packaging/file-minnow-krunner.desktop` to `~/.local/share/krunner/dbusplugins/` and
+`packaging/org.fileminnow.FileMinnow.SearchProvider.service` to
+`~/.local/share/dbus-1/services/`, changing its `Exec=` line to where `file-minnow` is.
 
 ## Desktop compatibility
 

@@ -1524,7 +1524,7 @@ fn build_menus(app: &AppRef, bar: &gtk::MenuBar) {
                 let t = w.clone();
                 item(&menu, "Search _Syntax", move || {
                     with_app(&t, |a| {
-                        a.info("Search syntax","invoice    Filename contains invoice\next:rs;toml    File extensions\nfile: / folder:    Entry type\npath:/Projects    Search full paths\ncase:README    Case-sensitive\nsize:>10mb    Size filter\ndm:today    Modified today\nregex:\"^report.*pdf$\"    Regular expression\n!draft    Exclude a term\n<apple banana> | orange    Grouping\n\nOR has precedence over AND.")
+                        a.info("Search syntax","invoice    Filename contains invoice\next:rs;toml    File extensions\nfile: / folder:    Entry type\npath:/Projects    Search full paths\ncase:README    Case-sensitive\nsize:>10mb    Size filter\ndm:today, dm:lastweek, dm:2026, dm:last7days    Date modified\ndupe:, dupe:size, dupe:content    Duplicates among the results\nparent:/home/alex/Documents    Directly inside a folder\nregex:\"^report.*pdf$\"    Regular expression\n!draft    Exclude a term\n<apple banana> | orange    Grouping\n\nOR has precedence over AND. Type : in the search box (or press Ctrl+Space) for the list of operators, filters and bookmarks.")
                     })
                 });
                 item(&menu, "_About", move || {
