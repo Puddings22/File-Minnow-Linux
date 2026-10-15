@@ -378,6 +378,12 @@ pub fn scan_into(
                 .collect(),
         };
         paths.sort_by(|a, b| path_cmp(a.as_os_str().as_bytes(), b.as_os_str().as_bytes()));
+        if let Some(list) = &root_config.list {
+            scan_list(
+                list, &root, &paths, &rules, data_dir, previous, builder, log,
+            );
+            continue;
+        }
         // An unplugged drive or unmounted share: keep what was indexed.
         if root_config.keep_offline
             && is_offline(&root)
@@ -481,6 +487,130 @@ pub fn scan_into(
     Ok(true)
 }
 
+/// The entries of a file list under `root`, inside `paths` (the root, or
+/// paths being updated), following the exclusion rules. A list that has
+/// not changed since it was last read (same file, size, time and mapping,
+/// recorded in `lists.json` in the data folder) keeps its entries.
+#[allow(clippy::too_many_arguments)] // the scan's inputs, for one root
+fn scan_list(
+    list: &crate::config::FileList,
+    root: &Path,
+    paths: &[PathBuf],
+    rules: &crate::config::PatternRules,
+    data_dir: &Path,
+    previous: Option<&Table>,
+    builder: &mut Builder,
+    log: &mut ScanLog,
+) {
+    let file = list.file.path();
+    let keep = |builder: &mut Builder| {
+        if let Some(previous) = previous {
+            for path in paths {
+                let bytes = path.as_os_str().as_bytes();
+                let start = previous.lower_bound(bytes);
+                builder.copy_range(previous, start, previous.subtree_end(start, bytes));
+            }
+        }
+    };
+    let meta = match fs::metadata(&file) {
+        Ok(m) => m,
+        Err(e) => {
+            record_error(log.errors, log.count, format!("{}: {e}", file.display()));
+            keep(builder);
+            return;
+        }
+    };
+    let root_bytes = root.as_os_str().as_bytes();
+    let stamp = format!(
+        "{}\n{}\n{}\n{}",
+        list.file.display(),
+        list.from,
+        meta.mtime(),
+        meta.len()
+    );
+    let stamps_file = data_dir.join("lists.json");
+    let mut stamps: std::collections::BTreeMap<String, String> = fs::read(&stamps_file)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let key = String::from_utf8_lossy(root_bytes).into_owned();
+    let indexed = previous.is_some_and(|previous| {
+        let at = previous.lower_bound(root_bytes);
+        at < previous.len() && previous.path(at) == root_bytes
+    });
+    if indexed && stamps.get(&key) == Some(&stamp) {
+        keep(builder);
+        return;
+    }
+    let records = fs::read(&file)
+        .map_err(anyhow::Error::from)
+        .and_then(|data| crate::efu::read(&data, file.parent().unwrap_or(Path::new("/"))));
+    let records = match records {
+        Ok(records) => records,
+        Err(e) => {
+            record_error(log.errors, log.count, format!("{}: {e}", file.display()));
+            keep(builder);
+            return;
+        }
+    };
+    let mut rows: Vec<(Vec<u8>, Kind, u64, i64, i64)> = vec![(
+        root_bytes.to_vec(),
+        Kind::Folder,
+        0,
+        meta.mtime(),
+        crate::table::NO_DATE,
+    )];
+    for record in records {
+        let Some(path) = crate::efu::map(&record.path, &list.from, root) else {
+            continue;
+        };
+        let kind = if record.folder {
+            Kind::Folder
+        } else {
+            Kind::File
+        };
+        let listed = path != root
+            && if record.folder {
+                rules.traverse(&path, root) && rules.index_folder(&path, root)
+            } else {
+                rules.traverse(&path, root) && rules.include_file(&path, root)
+            }
+            && path
+                .ancestors()
+                .skip(1)
+                .take_while(|a| *a != root)
+                .all(|a| rules.traverse(a, root));
+        if listed {
+            rows.push((
+                path.into_os_string().into_vec(),
+                kind,
+                if record.folder { 0 } else { record.size },
+                record.modified.unwrap_or(meta.mtime()),
+                record.created.unwrap_or(crate::table::NO_DATE),
+            ));
+        }
+    }
+    rows.sort_by(|a, b| path_cmp(&a.0, &b.0));
+    rows.dedup_by(|a, b| a.0 == b.0);
+    *log.visited += rows.len();
+    for (path, kind, size, modified, created) in rows {
+        let wanted = paths
+            .iter()
+            .any(|p| crate::table::within(&path, p.as_os_str().as_bytes()));
+        if wanted && !builder.push_with(&path, kind, size, modified, created) {
+            record_error(
+                log.errors,
+                log.count,
+                format!("{}: name too long to index", String::from_utf8_lossy(&path)),
+            );
+        }
+    }
+    stamps.insert(key, stamp);
+    if let Ok(json) = serde_json::to_vec(&stamps) {
+        let _ = crate::config::atomic_write(&stamps_file, &json);
+    }
+}
+
 /// Start-up catch-up from a saved index. Every indexed folder is checked
 /// (and watched) again, but only the folders whose modification time
 /// changed since the index was saved are read; the others keep their saved
@@ -517,7 +647,11 @@ pub fn quick_scan(
             count: &mut error_count,
             visited: &mut visited,
         };
-        if !root_config.recursive || !indexed || (root_config.keep_offline && is_offline(&root)) {
+        if !root_config.recursive
+            || !indexed
+            || root_config.list.is_some()
+            || (root_config.keep_offline && is_offline(&root))
+        {
             // Walked, or kept while offline, as a full scan would.
             let targets = [root.clone()];
             if !scan_into(

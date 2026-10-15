@@ -6,6 +6,7 @@ pub mod client;
 pub mod config;
 #[cfg(feature = "gui")]
 pub mod desktop;
+pub mod efu;
 #[cfg(feature = "gui")]
 pub mod file_ops;
 pub mod fold;

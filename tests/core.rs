@@ -596,3 +596,77 @@ fn duplicates_by_name_size_and_contents() {
     assert!(found("dupe:content path:a/").is_empty());
     assert!(Query::parse("dupe:colour").is_err());
 }
+
+#[test]
+fn file_lists_are_indexed_under_a_folder() {
+    use file_minnow::config::{IndexConfig, RootConfig};
+    let temp = tempfile::tempdir().unwrap();
+    let cache = store::prepare(&temp.path().join("cache")).unwrap();
+    let list = temp.path().join("nas.efu");
+    fs::write(
+        &list,
+        "Filename,Size,Date Modified,Date Created,Attributes\n\
+         \"\\\\nas\\share\\Photos\\\",,,,16\n\
+         \"\\\\nas\\share\\Photos\\beach.jpg\",2048,132537600000000000,,32\n\
+         \"\\\\nas\\share\\notes.tmp\",1,,,32\n\
+         \"\\\\other\\x.txt\",1,,,32\n",
+    )
+    .unwrap();
+    let shown = temp.path().join("nas");
+    let config = IndexConfig {
+        roots: vec![RootConfig::for_list(&list, "\\\\nas\\share", &shown)],
+        ..IndexConfig::default()
+    };
+    config.validate().unwrap();
+    let scan = |previous: Option<&file_minnow::table::Table>| {
+        index::scan_config_watched(&config, &cache, 1, None, previous, &|| false, &|_| {}, None)
+            .unwrap()
+            .unwrap()
+    };
+    let names = |s: &index::Snapshot| -> Vec<(String, u64)> {
+        s.entries
+            .entries()
+            .iter()
+            .map(|e| (e.display_path(), e.size))
+            .collect()
+    };
+    let first = scan(None);
+    let root = shown.display().to_string();
+    // The default excluded file types apply (notes.tmp), other servers do not belong.
+    assert_eq!(
+        names(&first),
+        [
+            (root.clone(), 2048),
+            (format!("{root}/Photos"), 2048),
+            (format!("{root}/Photos/beach.jpg"), 2048)
+        ]
+    );
+    assert_eq!(first.entries.entry(2).modified, 1_609_286_400);
+    // An unchanged list keeps its entries; a changed one is read again.
+    let again = scan(Some(&first.entries));
+    assert_eq!(names(&again), names(&first));
+    fs::write(
+        &list,
+        "Filename,Size\n\"\\\\nas\\share\\Photos\\sunset.jpg\",10\n",
+    )
+    .unwrap();
+    let changed = scan(Some(&again.entries));
+    assert_eq!(
+        names(&changed),
+        [
+            (root.clone(), 10),
+            (format!("{root}/Photos/sunset.jpg"), 10)
+        ]
+    );
+    // Searchable like any folder.
+    let found = query::search(
+        &changed,
+        &SearchRequest {
+            query: "sunset".into(),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(found.total, 1);
+}

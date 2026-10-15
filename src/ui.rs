@@ -2408,6 +2408,7 @@ impl App {
         for (name, pattern) in [
             ("CSV (name, path, size, dates, type)", "*.csv"),
             ("Text, one full path per line", "*.txt"),
+            ("Everything file list (EFU)", "*.efu"),
         ] {
             let filter = gtk::FileFilter::new();
             filter.set_name(Some(name));
@@ -2418,15 +2419,20 @@ impl App {
             if response == gtk::ResponseType::Accept
                 && let Some(path) = dialog.filename()
             {
-                let as_text = path
+                let extension = path
                     .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("txt"));
+                    .map(|e| e.to_string_lossy().to_ascii_lowercase());
+                let format = match extension.as_deref() {
+                    Some("txt") => Export::Text,
+                    Some("efu") => Export::Efu,
+                    _ => Export::Csv,
+                };
                 let query = query.clone();
                 let backend = backend.clone();
                 let messages = messages.clone();
                 std::thread::spawn(move || {
                     let report =
-                        match export_results(&backend, &query, sort, descending, &path, as_text) {
+                        match export_results(&backend, &query, sort, descending, &path, format) {
                             Ok(n) => format!("Exported {} results to {}", count(n), path.display()),
                             Err(e) => format!("Export failed: {e}"),
                         };
@@ -3692,19 +3698,29 @@ fn image_content(pixbuf: &gtk::gdk_pixbuf::Pixbuf) -> Option<PreviewContent> {
     })
 }
 /// Fetches all results page by page and writes them; returns the count.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Export {
+    Csv,
+    /// One full path per line.
+    Text,
+    /// An Everything file list.
+    Efu,
+}
 fn export_results(
     backend: &Backend,
     query: &str,
     sort: Sort,
     descending: bool,
     path: &std::path::Path,
-    as_text: bool,
+    format: Export,
 ) -> Result<usize> {
     use std::io::Write;
     let file = std::fs::File::create(path)?;
     let mut out = std::io::BufWriter::new(file);
-    if !as_text {
-        writeln!(out, "Name,Path,Size,Modified,Created,Type")?;
+    match format {
+        Export::Csv => writeln!(out, "Name,Path,Size,Modified,Created,Type")?,
+        Export::Efu => crate::efu::write_header(&mut out)?,
+        Export::Text => {}
     }
     let csv = |field: &str| -> String {
         if field.contains([',', '"', '\n', '\r']) {
@@ -3730,7 +3746,9 @@ fn export_results(
             break;
         }
         for e in &page.entries {
-            if as_text {
+            if format == Export::Efu {
+                writeln!(out, "{}", crate::efu::line(e))?;
+            } else if format == Export::Text {
                 out.write_all(&e.path)?;
                 out.write_all(b"\n")?;
             } else {

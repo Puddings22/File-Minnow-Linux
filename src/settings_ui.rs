@@ -354,8 +354,139 @@ fn chosen(tree: &gtk::TreeView) -> Option<usize> {
 fn fill_roots(store: &gtk::ListStore, draft: &Settings) {
     store.clear();
     for r in &draft.index.roots {
-        store.insert_with_values(None, &[(0, &r.path.display())]);
+        let label = match &r.list {
+            Some(list) => format!(
+                "{}   (file list {})",
+                r.path.display(),
+                list.file
+                    .path()
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ),
+            None => r.path.display(),
+        };
+        store.insert_with_values(None, &[(0, &label)]);
     }
+}
+/// Asks which part of a file list's paths stands for which local folder,
+/// then adds the list as a folder of the index.
+fn add_file_list(parent: &gtk::Dialog, done: impl Fn(RootConfig) + 'static) {
+    let chooser = gtk::FileChooserDialog::with_buttons(
+        Some("Add File List"),
+        Some(parent),
+        gtk::FileChooserAction::Open,
+        &[
+            ("Cancel", gtk::ResponseType::Cancel),
+            ("Next", gtk::ResponseType::Accept),
+        ],
+    );
+    chooser.set_modal(true);
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some("Everything file lists (EFU)"));
+    filter.add_pattern("*.efu");
+    filter.add_pattern("*.EFU");
+    chooser.add_filter(filter);
+    let parent = parent.clone();
+    let done: Rc<dyn Fn(RootConfig)> = Rc::new(done);
+    chooser.connect_response(move |chooser, response| {
+        let file = (response == gtk::ResponseType::Accept)
+            .then(|| chooser.filename())
+            .flatten();
+        chooser.close();
+        let Some(file) = file else {
+            return;
+        };
+        let records = std::fs::read(&file)
+            .map_err(anyhow::Error::from)
+            .and_then(|data| {
+                crate::efu::read(&data, file.parent().unwrap_or(std::path::Path::new("/")))
+            });
+        let from = match records {
+            Ok(records) => crate::efu::common_folder(&records),
+            Err(e) => {
+                let dialog = gtk::MessageDialog::new(
+                    Some(&parent),
+                    gtk::DialogFlags::MODAL | gtk::DialogFlags::DESTROY_WITH_PARENT,
+                    gtk::MessageType::Error,
+                    gtk::ButtonsType::Close,
+                    &format!("Cannot read {}: {e}", file.display()),
+                );
+                dialog.connect_response(|d, _| d.close());
+                dialog.show();
+                return;
+            }
+        };
+        let stem = file
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "list".into());
+        let to = if from.starts_with('/') {
+            from.clone()
+        } else {
+            glib::home_dir()
+                .join("File Lists")
+                .join(&stem)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let ask = gtk::Dialog::with_buttons(
+            Some("Add File List"),
+            Some(&parent),
+            gtk::DialogFlags::MODAL | gtk::DialogFlags::DESTROY_WITH_PARENT,
+            &[
+                ("Cancel", gtk::ResponseType::Cancel),
+                ("Add", gtk::ResponseType::Ok),
+            ],
+        );
+        ask.set_default_response(gtk::ResponseType::Ok);
+        ask.set_default_width(560);
+        let content = ask.content_area();
+        content.set_spacing(6);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        content.set_margin_top(12);
+        content.pack_start(
+            &caption("The listed files appear under a folder of this computer, like a mounted share or a drive kept elsewhere. They are greyed while that folder is not there."),
+            false,
+            false,
+            0,
+        );
+        let grid = gtk::Grid::new();
+        grid.set_row_spacing(6);
+        grid.set_column_spacing(8);
+        let from_entry = gtk::Entry::new();
+        from_entry.set_text(&from);
+        from_entry.set_hexpand(true);
+        let to_entry = gtk::Entry::new();
+        to_entry.set_text(&to);
+        to_entry.set_activates_default(true);
+        grid.attach(&caption("Paths in the list that start with"), 0, 0, 1, 1);
+        grid.attach(&from_entry, 1, 0, 1, 1);
+        grid.attach(&caption("appear under this folder"), 0, 1, 1, 1);
+        grid.attach(&to_entry, 1, 1, 1, 1);
+        content.pack_start(&grid, false, false, 0);
+        let error = caption("");
+        content.pack_start(&error, false, false, 0);
+        ask.show_all();
+        ask.connect_response({
+            let done = done.clone();
+            move |ask, response| {
+                if response != gtk::ResponseType::Ok {
+                    ask.close();
+                    return;
+                }
+                let to = std::path::PathBuf::from(to_entry.text().trim());
+                if !to.is_absolute() || to == std::path::Path::new("/") {
+                    error.set_text("Choose a folder such as /mnt/nas (a full path).");
+                    return;
+                }
+                done(RootConfig::for_list(&file, from_entry.text().trim(), &to));
+                ask.close();
+            }
+        });
+    });
+    chooser.show_all();
 }
 fn chooser(parent: &gtk::Dialog, title: &str, done: impl Fn(Vec<std::path::PathBuf>) + 'static) {
     let dialog = gtk::FileChooserDialog::with_buttons(
@@ -391,8 +522,13 @@ fn folders(dialog: &gtk::Dialog, draft: Rc<RefCell<Settings>>, error: gtk::Label
     row.pack_start(&scroll, true, true, 0);
     let buttons = gtk::Box::new(gtk::Orientation::Vertical, 6);
     let add = gtk::Button::with_label("Add Folder…");
+    let add_list = gtk::Button::with_label("Add File List…");
+    add_list.set_tooltip_text(Some(
+        "Index an Everything file list (.efu), such as one made on a server with “file-minnow search --efu”, or a catalogue of a drive you keep elsewhere.",
+    ));
     let remove = gtk::Button::with_label("Remove");
     buttons.pack_start(&add, false, false, 0);
+    buttons.pack_start(&add_list, false, false, 0);
     buttons.pack_start(&remove, false, false, 0);
     row.pack_start(&buttons, false, false, 0);
     page.pack_start(&row, true, true, 0);
@@ -490,6 +626,9 @@ fn folders(dialog: &gtk::Dialog, draft: Rc<RefCell<Settings>>, error: gtk::Label
                 enabled.set_active(r.enabled);
                 recursive.set_active(r.recursive);
                 monitor.set_active(r.monitor);
+                // A file list is read, not walked or watched.
+                recursive.set_sensitive(r.list.is_none());
+                monitor.set_sensitive(r.list.is_none());
                 keep.set_active(r.keep_offline);
                 match r.schedule {
                     Schedule::Interval { seconds } => {
@@ -591,6 +730,25 @@ fn folders(dialog: &gtk::Dialog, draft: Rc<RefCell<Settings>>, error: gtk::Label
                 if let Some(iter) = store.iter_first() {
                     tree.selection().select_iter(&iter);
                 }
+            });
+        });
+    }
+    {
+        let dialog = dialog.clone();
+        let draft = draft.clone();
+        let store = store.clone();
+        let tree = tree.clone();
+        add_list.connect_clicked(move |_| {
+            let (draft, store, tree) = (draft.clone(), store.clone(), tree.clone());
+            add_file_list(&dialog, move |root| {
+                let mut config = draft.borrow_mut();
+                config.index.roots.retain(|r| r.path != root.path);
+                config.index.roots.push(root);
+                fill_roots(&store, &config);
+                let last = config.index.roots.len() as i32 - 1;
+                drop(config);
+                tree.selection()
+                    .select_path(&gtk::TreePath::from_indicesv(&[last]));
             });
         });
     }

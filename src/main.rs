@@ -39,6 +39,9 @@ enum Command {
         json: bool,
         #[arg(long, conflicts_with = "json")]
         null: bool,
+        /// Write an Everything file list (EFU) of all matches
+        #[arg(long, conflicts_with_all = ["json", "null"])]
+        efu: bool,
         #[arg(long)]
         live: bool,
     },
@@ -149,15 +152,47 @@ fn main() -> Result<()> {
             descending,
             json,
             null,
+            efu,
             live,
         } => {
-            let req = SearchRequest {
+            let mut req = SearchRequest {
                 query,
                 limit,
                 offset,
                 sort,
                 descending,
             };
+            if efu {
+                // Every match, page by page.
+                let saved = if live { None } else { Some(store::load(&dir)?) };
+                let stdout = std::io::stdout();
+                let mut out = std::io::BufWriter::new(stdout.lock());
+                file_minnow::efu::write_header(&mut out)?;
+                req.limit = 10_000;
+                req.offset = 0;
+                loop {
+                    let page = match &saved {
+                        Some(s) => query::search(s, &req, None)?,
+                        None => {
+                            let r = service::request(&dir, &Request::Search(req.clone()))?;
+                            if let Some(e) = r.error {
+                                bail!(e);
+                            }
+                            r.search
+                                .ok_or_else(|| anyhow::anyhow!("Missing response"))?
+                        }
+                    };
+                    for e in &page.entries {
+                        writeln!(out, "{}", file_minnow::efu::line(e))?;
+                    }
+                    req.offset += page.entries.len();
+                    if page.entries.is_empty() || req.offset >= page.total {
+                        break;
+                    }
+                }
+                out.flush()?;
+                return Ok(());
+            }
             let response = if live {
                 let r = service::request(&dir, &Request::Search(req))?;
                 if let Some(e) = r.error {

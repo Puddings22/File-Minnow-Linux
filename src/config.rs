@@ -117,6 +117,18 @@ pub struct RootConfig {
     pub keep_offline: bool,
     /// Added automatically because a removable drive was plugged in.
     pub removable: bool,
+    /// Entries come from an Everything file list instead of the disk;
+    /// `path` is the folder they appear under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<FileList>,
+}
+/// An Everything file list (`.efu`) indexed as a folder.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileList {
+    pub file: RawPath,
+    /// The start of the listed paths that the folder stands for, as written
+    /// in the list (`\\server\share`, `D:\`, `/srv/share`).
+    pub from: String,
 }
 impl Default for RootConfig {
     fn default() -> Self {
@@ -128,6 +140,7 @@ impl Default for RootConfig {
             schedule: Schedule::default(),
             keep_offline: false,
             removable: false,
+            list: None,
         }
     }
 }
@@ -135,6 +148,22 @@ impl RootConfig {
     pub fn new(path: &Path) -> Self {
         Self {
             path: RawPath::new(path),
+            ..Self::default()
+        }
+    }
+    /// A file list shown under `folder`: never watched (it is read again
+    /// when the list file changes, checked every 5 minutes), and kept greyed
+    /// while the folder is not there (an unmounted share).
+    pub fn for_list(file: &Path, from: &str, folder: &Path) -> Self {
+        Self {
+            path: RawPath::new(folder),
+            monitor: false,
+            keep_offline: true,
+            schedule: Schedule::Interval { seconds: 300 },
+            list: Some(FileList {
+                file: RawPath::new(file),
+                from: from.to_owned(),
+            }),
             ..Self::default()
         }
     }
@@ -275,6 +304,9 @@ impl IndexConfig {
         }
         for (i, root) in self.roots.iter().enumerate() {
             validate_path(&root.path)?;
+            if let Some(list) = &root.list {
+                validate_path(&list.file)?;
+            }
             root.schedule.validate()?;
             let path = root.path.path();
             if ["/proc", "/sys", "/dev", "/run"]
