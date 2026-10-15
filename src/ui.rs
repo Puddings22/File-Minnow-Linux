@@ -8,6 +8,7 @@ use crate::{
     history::History,
     index::{Entry, Kind},
     query::{SearchRequest, SearchResponse, Sort},
+    rename::{self, Undo},
     settings_ui::OptionsWindow,
 };
 use anyhow::Result;
@@ -127,6 +128,12 @@ pub(crate) enum Message {
     Preview(u64, PreviewContent),
     /// The selection settled: load the preview.
     LoadPreview,
+    /// Renames finished (File Minnow's own, which Edit > Undo can revert).
+    Renamed(rename::Outcome),
+    /// These paths went to the Trash; the text summarizes the result.
+    Trashed(Vec<PathBuf>, String),
+    /// An undo finished: its summary or error, and the step to keep if it failed.
+    Undone(Result<String, String>),
 }
 pub(crate) enum PreviewContent {
     /// Decoded, already scaled pixels (RGB or RGBA, 8 bits per sample).
@@ -309,6 +316,9 @@ pub(crate) struct App {
     /// they match, a refresh keeps the selection and scroll position.
     shown_key: Option<(String, Sort, bool, usize)>,
     requested_key: (String, Sort, bool, usize),
+    /// Renames and moves to the Trash that Edit > Undo takes back, last last.
+    undo: Vec<Undo>,
+    undo_item: gtk::MenuItem,
 }
 impl Drop for App {
     fn drop(&mut self) {
@@ -635,6 +645,8 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
         preview_id: 0,
         shown_key: None,
         requested_key: (String::new(), Sort::Name, false, 0),
+        undo: Vec::new(),
+        undo_item: gtk::MenuItem::with_mnemonic("_Undo"),
     }));
     let weak = Rc::downgrade(&app);
     build_columns(&app);
@@ -1175,6 +1187,22 @@ fn build_menus(app: &AppRef, bar: &gtk::MenuBar) {
                 app.borrow_mut().bookmarks_menu = menu.clone();
             }
             "_Edit" => {
+                let undo = app.borrow().undo_item.clone();
+                if let Some(label) = undo
+                    .child()
+                    .and_then(|c| c.downcast::<gtk::AccelLabel>().ok())
+                {
+                    use glib::translate::IntoGlib;
+                    label.set_accel(
+                        gdk::keys::constants::z.into_glib(),
+                        gdk::ModifierType::CONTROL_MASK,
+                    );
+                }
+                undo.set_sensitive(false);
+                let t = w.clone();
+                undo.connect_activate(move |_| with_app(&t, App::undo));
+                menu.append(&undo);
+                menu.append(&gtk::SeparatorMenuItem::new());
                 let t = w.clone();
                 item(&menu, "Copy Full _Path", move || {
                     with_app(&t, |a| a.copy_selected(false))
@@ -1360,6 +1388,7 @@ fn connect_results(app: &AppRef) {
             key::c | key::C if ctrl => with_app(&w, |a| a.clipboard(false)),
             key::x | key::X if ctrl => with_app(&w, |a| a.clipboard(true)),
             key::a | key::A if ctrl => select_all(&w),
+            key::z | key::Z if ctrl => with_app(&w, App::undo),
             key::Delete | key::KP_Delete if mods.is_empty() => with_app(&w, App::trash_selected),
             key::F2 if mods.is_empty() => with_app(&w, App::rename_selected),
             key::Return | key::KP_Enter if mods == gdk::ModifierType::MOD1_MASK => {
@@ -1531,14 +1560,12 @@ fn popup(w: &AppWeak, event: Option<&gdk::EventButton>) {
     );
     menu_item(&menu, "Copy _Name", None, on(|a| a.copy_selected(true)));
     separator(&menu);
-    if items.len() == 1 {
-        menu_item(
-            &menu,
-            "_Rename…",
-            Some((key::F2, none)),
-            on(App::rename_selected),
-        );
-    }
+    menu_item(
+        &menu,
+        "_Rename…",
+        Some((key::F2, none)),
+        on(App::rename_selected),
+    );
     menu_item(
         &menu,
         "Mo_ve to Trash",
@@ -2498,6 +2525,45 @@ impl App {
                 app.borrow_mut().set_search(&query);
             }
             Message::LoadPreview => app.borrow_mut().load_preview(),
+            Message::Renamed(outcome) => {
+                let mut a = app.borrow_mut();
+                let count = outcome.done.len();
+                let text = match &outcome.error {
+                    None if count == 1 => "Renamed 1 item (Ctrl+Z undoes it)".to_owned(),
+                    None => format!("Renamed {count} items (Ctrl+Z undoes it)"),
+                    Some(e) => format!("Renamed {count} items, then stopped: {e}"),
+                };
+                if count > 0 {
+                    a.push_undo(Undo::Renamed(outcome.done));
+                }
+                if outcome.error.is_some() {
+                    a.info("Rename stopped", &text);
+                }
+                a.status.set_text(&text);
+                a.publish();
+            }
+            Message::Trashed(moved, text) => {
+                let mut a = app.borrow_mut();
+                // Items trashed through the portal (a snap) cannot be put back.
+                if !moved.is_empty() && !file_ops::confined() {
+                    a.push_undo(Undo::Trashed(moved));
+                }
+                a.spinner.stop();
+                a.status.set_text(&text);
+                a.publish();
+            }
+            Message::Undone(result) => {
+                let mut a = app.borrow_mut();
+                a.spinner.stop();
+                match result {
+                    Ok(text) => a.status.set_text(&text),
+                    Err(e) => {
+                        a.status.set_text(&e);
+                        a.info("Cannot undo", &e);
+                    }
+                }
+                a.publish();
+            }
             Message::Preview(id, content) => {
                 let a = app.borrow();
                 if id == a.preview_id && a.memory.preview {
@@ -2784,6 +2850,25 @@ impl App {
         }
     }
     fn rename_selected(&mut self) {
+        let selected = self.selected();
+        if selected.len() > 1 {
+            let items = selected
+                .iter()
+                .map(|e| rename::Item {
+                    path: e.path_buf(),
+                    folder: e.kind == Kind::Folder,
+                    modified: e.modified,
+                })
+                .collect();
+            let tx = self.messages.clone();
+            crate::rename_ui::show(&self.window, items, move |changes| {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send_blocking(Message::Renamed(rename::apply(&changes)));
+                });
+            });
+            return;
+        }
         let paths = self.selected_paths();
         let [path] = paths.as_slice() else {
             return;
@@ -2824,13 +2909,22 @@ impl App {
             _ => -1,
         };
         entry.select_region(0, stem);
+        let tx = self.messages.clone();
         dialog.connect_response(move |dialog, response| {
             if response != gtk::ResponseType::Ok {
                 dialog.close();
                 return;
             }
             match file_ops::rename(&path, &entry.text()) {
-                Ok(_) => dialog.close(),
+                Ok(target) => {
+                    if target != path {
+                        let _ = tx.try_send(Message::Renamed(rename::Outcome {
+                            done: vec![(path.clone(), target)],
+                            error: None,
+                        }));
+                    }
+                    dialog.close()
+                }
                 Err(e) => error.set_text(&e.to_string()),
             }
         });
@@ -2866,6 +2960,38 @@ impl App {
         } else {
             trash_paths(paths, self.messages.clone());
         }
+    }
+    /// Takes back the last rename or move to the Trash.
+    fn undo(&mut self) {
+        let Some(step) = self.undo.pop() else {
+            return;
+        };
+        self.refresh_undo();
+        self.busy("Undoing…");
+        let tx = self.messages.clone();
+        std::thread::spawn(move || {
+            let result = step
+                .run(&rename::TrashDirs::from_env())
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send_blocking(Message::Undone(result));
+        });
+    }
+    fn push_undo(&mut self, step: Undo) {
+        self.undo.push(step);
+        if self.undo.len() > 50 {
+            self.undo.remove(0);
+        }
+        self.refresh_undo();
+    }
+    fn refresh_undo(&self) {
+        let label = self
+            .undo
+            .last()
+            .map_or_else(|| "Undo".to_owned(), Undo::label);
+        self.undo_item
+            .set_label(&label.replacen("Undo", "_Undo", 1));
+        self.undo_item.set_use_underline(true);
+        self.undo_item.set_sensitive(!self.undo.is_empty());
     }
     /// Adds the selected files and folders to the excluded paths; the
     /// indexer then drops just those entries.
@@ -3097,16 +3223,23 @@ fn trash_paths(paths: Vec<PathBuf>, tx: async_channel::Sender<Message>) {
     std::thread::spawn(move || {
         let failures = file_ops::trash(&paths);
         let text = match failures.as_slice() {
-            [] if paths.len() == 1 => "Moved 1 item to the Trash".to_owned(),
-            [] => format!("Moved {} items to the Trash", paths.len()),
-            [only] => format!("Cannot move to the Trash: {only}"),
-            [first, rest @ ..] => format!(
+            [] if paths.len() == 1 => "Moved 1 item to the Trash (Ctrl+Z restores it)".to_owned(),
+            [] => format!(
+                "Moved {} items to the Trash (Ctrl+Z restores them)",
+                paths.len()
+            ),
+            [(_, only)] => format!("Cannot move to the Trash: {only}"),
+            [(_, first), rest @ ..] => format!(
                 "Cannot move {} items to the Trash: {first} (and {} more)",
                 failures.len(),
                 rest.len()
             ),
         };
-        let _ = tx.send_blocking(Message::Error(text));
+        let moved = paths
+            .into_iter()
+            .filter(|p| !failures.iter().any(|(f, _)| f == p))
+            .collect();
+        let _ = tx.send_blocking(Message::Trashed(moved, text));
     });
 }
 fn info(window: &gtk::Window, title: &str, text: &str) {

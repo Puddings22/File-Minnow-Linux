@@ -4,8 +4,7 @@ use crate::actions::file_uri;
 use anyhow::{Context, Result, bail};
 use gtk::{gdk, gio, glib, prelude::*};
 use std::{
-    ffi::{CString, OsString},
-    os::unix::ffi::OsStrExt,
+    ffi::OsString,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -329,46 +328,24 @@ pub fn set_clipboard_files(paths: &[PathBuf], cut: bool) {
 /// Renames within the same folder and never replaces an existing entry.
 pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf> {
     let new_name = new_name.trim_end_matches('\n');
-    if new_name.is_empty() || new_name == "." || new_name == ".." || new_name.contains(['/', '\0'])
-    {
-        bail!("A name cannot be empty, “.” or “..”, or contain “/”.");
+    if let Some(problem) = crate::rename::invalid_name(new_name) {
+        bail!("{problem}.");
     }
     let target = path.with_file_name(new_name);
     if target == path {
         return Ok(target);
     }
-    let from = CString::new(path.as_os_str().as_bytes())?;
-    let to = CString::new(target.as_os_str().as_bytes())?;
-    // SAFETY: both strings are valid NUL-terminated paths for this call.
-    let result = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 {
-        return Ok(target);
-    }
-    let error = std::io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::EEXIST) => bail!("“{new_name}” already exists in this folder."),
-        // Filesystems without RENAME_NOREPLACE: check, then rename.
-        Some(libc::EINVAL) | Some(libc::ENOSYS) => {
-            if std::fs::symlink_metadata(&target).is_ok() {
-                bail!("“{new_name}” already exists in this folder.");
-            }
-            std::fs::rename(path, &target)?;
-            Ok(target)
+    match crate::rename::rename_path(path, &target) {
+        Ok(()) => Ok(target),
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+            bail!("“{new_name}” already exists in this folder.")
         }
-        _ => Err(error.into()),
+        Err(e) => Err(e.into()),
     }
 }
 
-/// Moves entries to the desktop trash. Returns one message per failure.
-pub fn trash(paths: &[PathBuf]) -> Vec<String> {
+/// Moves entries to the desktop trash. Returns each failure with its path.
+pub fn trash(paths: &[PathBuf]) -> Vec<(PathBuf, String)> {
     paths
         .iter()
         .filter_map(|path| {
@@ -380,7 +357,7 @@ pub fn trash(paths: &[PathBuf]) -> Vec<String> {
                     .err()
                     .map(|e| e.message().to_owned())
             };
-            error.map(|e| format!("{}: {e}", path.display()))
+            error.map(|e| (path.clone(), format!("{}: {e}", path.display())))
         })
         .collect()
 }

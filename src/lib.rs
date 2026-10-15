@@ -12,6 +12,9 @@ pub mod index;
 pub mod integrations;
 pub mod mounts;
 pub mod query;
+pub mod rename;
+#[cfg(feature = "gui")]
+pub mod rename_ui;
 pub mod runtime;
 pub mod service;
 #[cfg(feature = "gui")]

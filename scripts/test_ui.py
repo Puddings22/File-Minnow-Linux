@@ -398,6 +398,55 @@ try:
             assert time.monotonic() < deadline, 'Delete did not move the file to the Trash'
             time.sleep(.05)
         wait_window(lambda s: s['matches'] == 0)
+        undo_checks = {}
+        if not args.confined:
+            # Ctrl+Z puts it back from the Trash; Delete trashes it again.
+            xdo('key', 'ctrl+z')
+            deadline = time.monotonic() + 5
+            while trash.exists() or not (files / 'renamed.rs').exists():
+                assert time.monotonic() < deadline, 'Ctrl+Z did not restore from the Trash'
+                time.sleep(.05)
+            wait_window(lambda s: s['matches'] == 1)
+            xdo('mousemove', '--window', window, '150', '107', 'click', '1')
+            time.sleep(.2)
+            xdo('key', 'Delete')
+            wait_window(lambda s: s['matches'] == 0)
+            undo_checks['undo_trash'] = True
+        # Renaming several results at once, then undoing it.
+        xdo('windowfocus', '--sync', window)
+        xdo('key', 'ctrl+l')
+        xdo('type', '--delay', '10', 'ext:pdf')
+        wait_window(lambda s: s['query'] == 'ext:pdf' and s['matches'] == 2)
+        xdo('mousemove', '--window', window, '150', '107', 'click', '1')
+        time.sleep(.2)
+        xdo('key', 'ctrl+a')
+        wait_window(lambda s: s['selected_count'] == 2)
+        xdo('key', 'F2')
+        rename_window = xdo('search', '--sync', '--onlyvisible', '--name', '^Rename 2 Items$').splitlines()[0]
+        xdo('windowfocus', '--sync', rename_window)
+        time.sleep(.3)
+        xdo('type', '--delay', '20', 'pdf')
+        xdo('key', 'Tab')
+        xdo('type', '--delay', '20', 'PDF')
+        xdo('key', 'Tab', 'Tab', 'Tab', 'space')  # Change the extension too
+        time.sleep(.3)
+        subprocess.run(['import', '-quiet', '-window', rename_window, str(output / 'bulk-rename.png')], env=env, check=True)
+        xdo('key', 'shift+Tab', 'shift+Tab', 'shift+Tab', 'Return')
+        deadline = time.monotonic() + 5
+        while not ((files / 'invoice.PDF').exists() and (files / 'draft.PDF').exists()):
+            assert time.monotonic() < deadline, f'bulk rename did not happen: {sorted(p.name for p in files.iterdir())}'
+            time.sleep(.05)
+        assert not (files / 'invoice.pdf').exists()
+        wait_window(lambda s: s['matches'] == 2)
+        xdo('windowfocus', '--sync', window)
+        xdo('mousemove', '--window', window, '150', '107', 'click', '1')
+        time.sleep(.2)
+        xdo('key', 'ctrl+z')
+        deadline = time.monotonic() + 5
+        while not ((files / 'invoice.pdf').exists() and (files / 'draft.pdf').exists()):
+            assert time.monotonic() < deadline, f'undo did not restore names: {sorted(p.name for p in files.iterdir())}'
+            time.sleep(.05)
+        undo_checks['bulk_rename_and_undo'] = True
         # Type filter next to the search box, and the Type column.
         xdo('windowfocus', '--sync', window)
         xdo('key', 'ctrl+l', 'BackSpace')
@@ -502,7 +551,7 @@ try:
         wait_window(lambda s: s['query'] == scope + 'invoice' and s['matches'] == 1)
         xdo('key', 'ctrl+l', 'BackSpace')
         wait_window(lambda s: s['query'] == '')
-        menu_checks = {'drag_out_selection': True, 'bookmarks_menu': True, 'custom_filter': True, 'export_csv': True, 'view_menu_remembered': True, 'show_in_folder_scope': True, 'search_here_cursor_after_folder': True, 'empty_until_search': True, 'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
+        menu_checks = {**undo_checks, 'drag_out_selection': True, 'bookmarks_menu': True, 'custom_filter': True, 'export_csv': True, 'view_menu_remembered': True, 'show_in_folder_scope': True, 'search_here_cursor_after_folder': True, 'empty_until_search': True, 'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
         # Right-click > Exclude from Index drops the entry and lists the path
         # in the exclusions.
         xdo('windowfocus', '--sync', window)
