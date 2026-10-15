@@ -232,6 +232,24 @@ pub fn normalize_file_type(input: &str) -> Option<String> {
     .then_some(ext)
 }
 impl IndexConfig {
+    /// A hash of everything that decides which entries are indexed, kept
+    /// with the index: a saved index made with other settings is walked
+    /// again in full at start-up.
+    pub fn fingerprint(&self) -> u64 {
+        let mut rules = self.clone();
+        for root in &mut rules.roots {
+            root.schedule = Schedule::Never;
+        }
+        rules.event_debounce_ms = 0;
+        rules.fallback_rescan_seconds = 0;
+        serde_json::to_vec(&rules)
+            .unwrap_or_default()
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+                (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+            })
+            | 1
+    }
     pub fn from_roots(roots: &[PathBuf]) -> Self {
         Self {
             roots: roots.iter().map(|p| RootConfig::new(p)).collect(),

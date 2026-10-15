@@ -75,6 +75,7 @@ pub fn reconcile_watched(
             kept.push(target);
         }
     }
+    let rescanned = kept.clone();
     let mut errors = snapshot.errors.clone();
     let mut error_count = snapshot.error_count;
     let mut visited = 0;
@@ -137,7 +138,7 @@ pub fn reconcile_watched(
     }
     let entries = builder.finish();
     entries.splice_name_order(old, &unchanged);
-    Ok(Some(Snapshot {
+    let mut next = Snapshot {
         roots: config
             .roots
             .iter()
@@ -149,7 +150,18 @@ pub fn reconcile_watched(
         scanned_at: index::now(),
         errors,
         error_count,
-    }))
+        saved_at: 0,
+        config: config.fingerprint(),
+        walked: snapshot.walked.clone(),
+    };
+    // A rescan of a whole root (scheduled or asked for) walked it completely.
+    next.mark_walked(
+        rescanned
+            .iter()
+            .filter(|t| roots.contains(t))
+            .map(|t| t.as_os_str().as_bytes().to_vec()),
+    );
+    Ok(Some(next))
 }
 
 #[derive(Serialize, Deserialize)]

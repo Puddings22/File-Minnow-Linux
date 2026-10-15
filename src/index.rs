@@ -137,6 +137,16 @@ pub struct Snapshot {
     pub scanned_at: u64,
     pub errors: Vec<String>,
     pub error_count: usize,
+    /// When the index was last saved (set in the saved copy only).
+    #[serde(default)]
+    pub saved_at: u64,
+    /// `IndexConfig::fingerprint` of the settings these entries follow.
+    #[serde(default)]
+    pub config: u64,
+    /// When each root was last walked completely, for scheduled rescans
+    /// that were missed while File Minnow was not running.
+    #[serde(default)]
+    pub walked: Vec<(Vec<u8>, u64)>,
 }
 impl Snapshot {
     /// The same metadata with no entries, for persistence headers.
@@ -148,7 +158,29 @@ impl Snapshot {
             scanned_at: self.scanned_at,
             errors: self.errors.clone(),
             error_count: self.error_count,
+            saved_at: self.saved_at,
+            config: self.config,
+            walked: self.walked.clone(),
         }
+    }
+    /// When `root` was last walked completely (0: never).
+    pub fn walked_at(&self, root: &[u8]) -> u64 {
+        self.walked
+            .iter()
+            .find(|(r, _)| r == root)
+            .map_or(0, |(_, t)| *t)
+    }
+    /// Records that these roots were just walked completely.
+    pub fn mark_walked(&mut self, roots: impl IntoIterator<Item = Vec<u8>>) {
+        let time = now();
+        for root in roots {
+            match self.walked.iter_mut().find(|(r, _)| *r == root) {
+                Some(entry) => entry.1 = time,
+                None => self.walked.push((root, time)),
+            }
+        }
+        let current = self.roots.clone();
+        self.walked.retain(|(r, _)| current.contains(r));
     }
 }
 pub fn now() -> u64 {
@@ -287,19 +319,24 @@ pub fn scan_config_watched(
     if !completed {
         return Ok(None);
     }
-    Ok(Some(Snapshot {
-        roots: config
-            .roots
-            .iter()
-            .filter(|r| r.enabled)
-            .map(|r| r.path.0.clone())
-            .collect(),
+    let roots: Vec<Vec<u8>> = config
+        .roots
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.path.0.clone())
+        .collect();
+    let mut snapshot = Snapshot {
+        roots: roots.clone(),
         entries: builder.finish(),
         generation,
         scanned_at: now(),
         errors,
         error_count,
-    }))
+        config: config.fingerprint(),
+        ..Snapshot::default()
+    };
+    snapshot.mark_walked(roots);
+    Ok(Some(snapshot))
 }
 
 pub struct ScanLog<'a> {
@@ -438,4 +475,275 @@ pub fn scan_into(
     }
     progress(*log.visited);
     Ok(true)
+}
+
+/// Start-up catch-up from a saved index. Every indexed folder is checked
+/// (and watched) again, but only the folders whose modification time
+/// changed since the index was saved are read; the others keep their saved
+/// entries. That is one `stat` per folder instead of one per entry. A file
+/// changed in place while File Minnow was not running does not change its
+/// folder, so it keeps its old size and date until the next full walk (the
+/// scheduled rescan). Returns None when interrupted.
+pub fn quick_scan(
+    config: &crate::config::IndexConfig,
+    data_dir: &Path,
+    previous: &Snapshot,
+    cancel: &dyn Fn() -> bool,
+    progress: &dyn Fn(usize),
+    watch: WatchHook,
+) -> Result<Option<Snapshot>> {
+    let rules = crate::config::PatternRules::new(config)?;
+    let table = &previous.entries;
+    let mut builder = Builder::with_capacity(table.len());
+    let mut errors = Vec::new();
+    let mut error_count = 0;
+    let mut visited = 0;
+    let mut kept = Vec::new();
+    let mut roots: Vec<_> = config.roots.iter().filter(|r| r.enabled).collect();
+    roots.sort_by(|a, b| path_cmp(&a.path.0, &b.path.0));
+    for root_config in roots {
+        let root = root_config.path.path();
+        let bytes = root.as_os_str().as_bytes();
+        let start = table.lower_bound(bytes);
+        let indexed = start < table.len()
+            && table.path(start) == bytes
+            && table.row(start).kind == Kind::Folder;
+        let mut log = ScanLog {
+            errors: &mut errors,
+            count: &mut error_count,
+            visited: &mut visited,
+        };
+        if !root_config.recursive || !indexed || (root_config.keep_offline && is_offline(&root)) {
+            // Walked, or kept while offline, as a full scan would.
+            let targets = [root.clone()];
+            if !scan_into(
+                config,
+                data_dir,
+                Some(&targets),
+                Some(table),
+                &mut builder,
+                &mut log,
+                cancel,
+                progress,
+                watch,
+            )? {
+                return Ok(None);
+            }
+            continue;
+        }
+        let mut walk = Quick {
+            config,
+            data_dir,
+            rules: &rules,
+            table,
+            // A folder changed within two seconds of the save may have
+            // changed after it was read, within the same second.
+            changed_after: previous.saved_at as i64 - 2,
+            root: &root,
+            monitor: root_config.monitor,
+            builder: &mut builder,
+            kept: &mut kept,
+            log,
+            cancel,
+            progress,
+            watch,
+        };
+        let end = table.subtree_end(start, bytes);
+        if !walk.folder(&root, start, end)? {
+            return Ok(None);
+        }
+    }
+    progress(visited);
+    let entries = builder.finish();
+    entries.splice_name_order(table, &kept);
+    Ok(Some(Snapshot {
+        roots: config
+            .roots
+            .iter()
+            .filter(|r| r.enabled)
+            .map(|r| r.path.0.clone())
+            .collect(),
+        entries,
+        generation: previous.generation + 1,
+        scanned_at: now(),
+        errors,
+        error_count,
+        saved_at: 0,
+        config: config.fingerprint(),
+        walked: previous.walked.clone(),
+    }))
+}
+
+struct Quick<'a, 'b> {
+    config: &'a crate::config::IndexConfig,
+    data_dir: &'a Path,
+    rules: &'a crate::config::PatternRules,
+    table: &'a Table,
+    changed_after: i64,
+    root: &'a Path,
+    monitor: bool,
+    builder: &'a mut Builder,
+    /// Rows copied unchanged: (old start, old end, new start).
+    kept: &'a mut Vec<(usize, usize, usize)>,
+    log: ScanLog<'b>,
+    cancel: &'a dyn Fn() -> bool,
+    progress: &'a dyn Fn(usize),
+    watch: WatchHook<'a>,
+}
+impl Quick<'_, '_> {
+    fn copy(&mut self, start: usize, end: usize) {
+        if start < end {
+            self.kept.push((start, end, self.builder.len()));
+            self.builder.copy_range(self.table, start, end);
+        }
+    }
+    fn tick(&mut self) -> bool {
+        *self.log.visited += 1;
+        if (*self.log.visited).is_multiple_of(512) {
+            (self.progress)(*self.log.visited);
+        }
+        !(self.cancel)()
+    }
+    /// A path that is new, or no longer a folder: walked in full.
+    fn walk(&mut self, path: &Path) -> Result<bool> {
+        let targets = [path.to_path_buf()];
+        scan_into(
+            self.config,
+            self.data_dir,
+            Some(&targets),
+            None,
+            self.builder,
+            &mut self.log,
+            self.cancel,
+            self.progress,
+            self.watch,
+        )
+    }
+    /// The indexed folder `path` at `row`, its subtree ending at `end`.
+    fn folder(&mut self, path: &Path, row: usize, end: usize) -> Result<bool> {
+        if !self.tick() {
+            return Ok(false);
+        }
+        // Watched before it is checked, so no change is missed in between.
+        if self.monitor
+            && let Some(watch) = self.watch
+        {
+            watch(path);
+        }
+        let meta = match fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(e) => {
+                record_error(
+                    self.log.errors,
+                    self.log.count,
+                    format!("{}: {e}", path.display()),
+                );
+                self.copy(row, end);
+                return Ok(true);
+            }
+        };
+        if !meta.is_dir() {
+            return self.walk(path);
+        }
+        let unchanged =
+            meta.mtime() == self.table.row(row).modified && meta.mtime() < self.changed_after;
+        if unchanged {
+            // The folder's own entries are as saved; its subfolders are
+            // checked in turn.
+            let (mut i, mut run) = (row + 1, row);
+            while i < end {
+                if self.table.row(i).kind != Kind::Folder {
+                    i += 1;
+                    continue;
+                }
+                self.copy(run, i);
+                let child = self.table.path(i);
+                let child_end = self.table.subtree_end(i, &child);
+                let child = PathBuf::from(std::ffi::OsString::from_vec(child));
+                if !self.folder(&child, i, child_end)? {
+                    return Ok(false);
+                }
+                (i, run) = (child_end, child_end);
+            }
+            self.copy(run, end);
+            return Ok(true);
+        }
+        if self.rules.index_folder(path, self.root) {
+            self.builder.push_with(
+                path.as_os_str().as_bytes(),
+                Kind::Folder,
+                meta.len(),
+                meta.mtime(),
+                created_of(&meta),
+            );
+        }
+        let mut names: Vec<std::ffi::OsString> = match fs::read_dir(path) {
+            Ok(entries) => entries
+                .filter_map(|e| e.ok().map(|e| e.file_name()))
+                .collect(),
+            Err(e) => {
+                record_error(
+                    self.log.errors,
+                    self.log.count,
+                    format!("{}: {e}", path.display()),
+                );
+                self.copy(row + 1, end);
+                return Ok(true);
+            }
+        };
+        names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        for name in names {
+            if !self.tick() {
+                return Ok(false);
+            }
+            let child = path.join(&name);
+            if excluded(&child, self.data_dir) || !self.rules.traverse(&child, self.root) {
+                continue;
+            }
+            let m = match fs::symlink_metadata(&child) {
+                Ok(m) => m,
+                Err(e) => {
+                    record_error(
+                        self.log.errors,
+                        self.log.count,
+                        format!("{}: {e}", child.display()),
+                    );
+                    continue;
+                }
+            };
+            let kind = kind_of(&m);
+            if kind == Kind::Folder {
+                let bytes = child.as_os_str().as_bytes();
+                let at = self.table.lower_bound(bytes);
+                let known = at < end
+                    && self.table.row(at).kind == Kind::Folder
+                    && self.table.path(at) == bytes;
+                let completed = if known {
+                    let child_end = self.table.subtree_end(at, bytes);
+                    self.folder(&child, at, child_end)?
+                } else {
+                    self.walk(&child)?
+                };
+                if !completed {
+                    return Ok(false);
+                }
+            } else if self.rules.include_file(&child, self.root)
+                && !self.builder.push_with(
+                    child.as_os_str().as_bytes(),
+                    kind,
+                    m.len(),
+                    m.mtime(),
+                    created_of(&m),
+                )
+            {
+                record_error(
+                    self.log.errors,
+                    self.log.count,
+                    format!("{}: name too long to index", child.display()),
+                );
+            }
+        }
+        Ok(true)
+    }
 }

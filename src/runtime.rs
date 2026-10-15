@@ -424,8 +424,30 @@ fn reset_deadlines(config: &IndexConfig, deadlines: &mut BTreeMap<PathBuf, u64>)
         }
     }
 }
-/// How long small updates may stay unsaved. Startup always rescans, so a
-/// crash only delays (never loses) those changes.
+/// After a start-up catch-up, how long a scheduled rescan that was missed
+/// while File Minnow was not running waits, so it does not compete with
+/// the rest of the login.
+const MISSED_RESCAN_DELAY: u64 = 600;
+fn catch_up_missed_rescans(
+    config: &IndexConfig,
+    snapshot: &Snapshot,
+    deadlines: &mut BTreeMap<PathBuf, u64>,
+) {
+    let time = index::now();
+    for root in config.roots.iter().filter(|r| r.enabled) {
+        let walked = snapshot.walked_at(&root.path.0);
+        if root
+            .schedule
+            .next_after(walked)
+            .is_some_and(|due| due <= time)
+        {
+            deadlines.insert(root.path.path(), time + MISSED_RESCAN_DELAY);
+        }
+    }
+}
+/// How long small updates may stay unsaved. After a crash, start-up finds
+/// them again through their folders' changed times (and files changed in
+/// place at the next full walk), so they are delayed, never lost.
 const SAVE_DELAY: Duration = Duration::from_secs(300);
 struct Worker {
     dir: PathBuf,
@@ -499,7 +521,13 @@ impl Worker {
         let mut sweep = 0_u32;
         let mut deadlines = BTreeMap::new();
         reset_deadlines(&config, &mut deadlines);
-        let mut full = true;
+        // A saved index made with the same settings only needs its changed
+        // folders read again (`index::quick_scan`); otherwise walk everything.
+        let mut quick = index::root_paths(&current.roots) == config.paths()
+            && !current.entries.is_empty()
+            && current.saved_at > 0
+            && current.config == config.fingerprint();
+        let mut full = !quick;
         let mut changed = BTreeSet::new();
         let mut dirty: Option<Instant> = None;
         // Changes since the last save. Full scans save at once; smaller
@@ -606,7 +634,8 @@ impl Worker {
             }
             let wait = Duration::from_millis(config.event_debounce_ms).max(update_cost * 10);
             let ready = dirty.is_some_and(|t| t.elapsed() >= wait);
-            if full || ready {
+            if full || quick || ready {
+                quick &= !full;
                 {
                     let mut s = state.write().unwrap();
                     s.status.scanning = true;
@@ -614,6 +643,8 @@ impl Worker {
                     s.status.visited = 0;
                     s.status.message = if full {
                         "Reconciling folders…"
+                    } else if quick {
+                        "Checking folders for changes…"
                     } else {
                         "Updating changed paths…"
                     }
@@ -635,7 +666,9 @@ impl Worker {
                     }
                 };
                 let update_started = Instant::now();
-                if full && let Some(watcher) = &watcher {
+                if (full || quick)
+                    && let Some(watcher) = &watcher
+                {
                     sweep = watcher.begin_sweep();
                 }
                 let add_watch = |folder: &Path| {
@@ -655,13 +688,15 @@ impl Worker {
                         &progress,
                         hook,
                     )?
+                } else if quick {
+                    index::quick_scan(&config, dir, &current, &cancel, &progress, hook)?
                 } else {
                     crate::service::reconcile_watched(
                         &current, &changed, &config, dir, &cancel, &progress, hook,
                     )?
                 };
                 if let Some(watcher) = &watcher {
-                    if full && next.is_some() {
+                    if (full || quick) && next.is_some() {
                         watcher.finish_sweep(sweep);
                     }
                     let (mut errors, failed) = watcher.errors();
@@ -676,7 +711,7 @@ impl Worker {
                     update_cost = update_started.elapsed().min(Duration::from_secs(3));
                 }
                 if let Some(next) = next {
-                    let persisted = if full {
+                    let persisted = if full || quick {
                         {
                             let mut s = state.write().unwrap();
                             s.status.phase = "saving".into();
@@ -722,7 +757,11 @@ impl Worker {
                     if full {
                         reset_deadlines(&config, &mut deadlines);
                     }
+                    if quick {
+                        catch_up_missed_rescans(&config, &current, &mut deadlines);
+                    }
                     full = false;
+                    quick = false;
                     changed.clear();
                     dirty = None;
                 } else {
@@ -761,9 +800,53 @@ impl Worker {
                 .min(scheduled);
             thread::park_timeout(delay.max(Duration::from_millis(1)));
         }
+        // Changes that arrived just before quitting are applied first, so
+        // the saved index does not miss them.
+        if !changed.is_empty()
+            && changed.len() <= 1000
+            && let Ok(Some(next)) = crate::service::reconcile_watched(
+                &current,
+                &changed,
+                &config,
+                dir,
+                &|| false,
+                &|_| {},
+                None,
+            )
+        {
+            current = Arc::new(next);
+            unsaved.get_or_insert_with(Instant::now);
+        }
         if unsaved.is_some() {
             store::save(dir, &current)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn missed_rescans_wait_after_start_up() {
+        let mut config = IndexConfig::from_roots(&[PathBuf::from("/a"), PathBuf::from("/b")]);
+        config.roots[0].schedule = crate::config::Schedule::Interval { seconds: 3600 };
+        config.roots[1].schedule = crate::config::Schedule::Interval { seconds: 3600 };
+        let mut snapshot = Snapshot {
+            roots: vec![b"/a".to_vec(), b"/b".to_vec()],
+            ..Snapshot::default()
+        };
+        snapshot.walked = vec![
+            (b"/a".to_vec(), index::now() - 7200),
+            (b"/b".to_vec(), index::now()),
+        ];
+        let mut deadlines = BTreeMap::new();
+        reset_deadlines(&config, &mut deadlines);
+        catch_up_missed_rescans(&config, &snapshot, &mut deadlines);
+        let now = index::now();
+        // /a missed its hourly rescan: it runs ten minutes from now, not at once.
+        assert!((now + MISSED_RESCAN_DELAY).abs_diff(deadlines[&PathBuf::from("/a")]) <= 2);
+        // /b was walked just now: its next rescan is an hour away.
+        assert!(deadlines[&PathBuf::from("/b")] >= now + 3500);
     }
 }

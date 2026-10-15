@@ -118,11 +118,15 @@ fn scan_links_names_exclusions_and_persistence() {
     assert_ne!(alpha.path(), alias.path());
     let _lock = store::writer_lock(&cache).unwrap();
     store::save(&cache, &s).unwrap();
-    let restored = store::load(&cache).unwrap();
+    let mut restored = store::load(&cache).unwrap();
+    // The saved copy records when it was saved; the rest round-trips.
+    assert!(restored.saved_at >= s.scanned_at);
+    let saved_at = std::mem::take(&mut restored.saved_at);
     assert_eq!(
         serde_json::to_value(&s).unwrap(),
         serde_json::to_value(&restored).unwrap()
     );
+    restored.saved_at = saved_at;
     assert_eq!(s.entries.entries(), restored.entries.entries());
     assert_eq!(
         fs::metadata(cache.join("index.bin"))
@@ -456,4 +460,86 @@ fn root_updates_are_persisted() {
 fn relative_root_and_pseudo_filesystems() {
     assert!(index::normalize_roots(&[PathBuf::from("/proc")]).is_err());
     assert!(index::normalize_roots(&[]).is_err());
+}
+
+#[test]
+fn startup_catch_up_reads_only_changed_folders() {
+    use std::time::{Duration, SystemTime};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("files");
+    let dir = temp.path().join("cache");
+    fs::create_dir_all(&dir).unwrap();
+    for folder in ["a", "b/c", "quiet"] {
+        fs::create_dir_all(root.join(folder)).unwrap();
+    }
+    for (file, text) in [
+        ("a/1.txt", "1"),
+        ("b/2.txt", "22"),
+        ("b/c/3.txt", "333"),
+        ("quiet/4.txt", "4"),
+    ] {
+        fs::write(root.join(file), text).unwrap();
+    }
+    let set_time = |path: &std::path::Path, time: SystemTime| {
+        fs::File::open(path).unwrap().set_modified(time).unwrap();
+    };
+    let long_ago = SystemTime::now() - Duration::from_secs(100);
+    for folder in ["", "a", "b", "b/c", "quiet"] {
+        set_time(&root.join(folder), long_ago);
+    }
+    let config = file_minnow::config::IndexConfig::from_roots(std::slice::from_ref(&root));
+    let mut saved = index::scan_config(&config, &dir, 1, None, &|| false, &|_| {})
+        .unwrap()
+        .unwrap();
+    saved.saved_at = index::now() - 50;
+    // While "not running": a file added, one deleted, a new folder, and a
+    // file changed in place (its folder's time does not change).
+    fs::write(root.join("b/new.txt"), "n").unwrap();
+    fs::remove_file(root.join("a/1.txt")).unwrap();
+    fs::create_dir_all(root.join("d/e")).unwrap();
+    fs::write(root.join("d/e/deep.txt"), "d").unwrap();
+    fs::write(root.join("b/c/3.txt"), "3333333").unwrap();
+    set_time(&root.join("b/c"), long_ago);
+    let quick = index::quick_scan(&config, &dir, &saved, &|| false, &|_| {}, None)
+        .unwrap()
+        .unwrap();
+    let full = index::scan_config(&config, &dir, 2, None, &|| false, &|_| {})
+        .unwrap()
+        .unwrap();
+    let listing = |s: &index::Snapshot| -> Vec<(String, u64)> {
+        s.entries
+            .entries()
+            .iter()
+            .filter(|e| e.kind == index::Kind::File)
+            .map(|e| (e.display_path(), e.size))
+            .collect()
+    };
+    let mut expected = listing(&full);
+    for (path, size) in &mut expected {
+        if path.ends_with("3.txt") {
+            *size = 3; // kept from the saved index until the next full walk
+        }
+    }
+    assert_eq!(listing(&quick), expected);
+    let paths = |s: &index::Snapshot| -> Vec<Vec<u8>> {
+        s.entries
+            .entries()
+            .iter()
+            .map(|e| e.path.to_vec())
+            .collect()
+    };
+    assert_eq!(
+        paths(&quick),
+        paths(&full),
+        "same entries in the same order"
+    );
+    assert_eq!(quick.config, config.fingerprint());
+    assert_eq!(quick.generation, 2);
+    // A changed setting is not a catch-up: the fingerprint differs.
+    let mut other = config.clone();
+    other.exclude_hidden = !other.exclude_hidden;
+    assert_ne!(other.fingerprint(), config.fingerprint());
+    let mut scheduled = config.clone();
+    scheduled.roots[0].schedule = file_minnow::config::Schedule::Never;
+    assert_eq!(scheduled.fingerprint(), config.fingerprint());
 }

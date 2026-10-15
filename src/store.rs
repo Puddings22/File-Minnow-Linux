@@ -199,7 +199,9 @@ pub fn save(dir: &Path, snapshot: &Snapshot) -> Result<()> {
             sum: Checksum(0),
         };
         w.out.write_all(MAGIC)?;
-        w.block(&serde_json::to_vec(&snapshot.header())?)?;
+        let mut header = snapshot.header();
+        header.saved_at = crate::index::now();
+        w.block(&serde_json::to_vec(&header)?)?;
         let (names, dirs, rows) = snapshot.entries.parts();
         w.u64(dirs.len() as u64)?;
         for dir in dirs.iter() {
