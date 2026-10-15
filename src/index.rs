@@ -351,6 +351,16 @@ pub fn scan_into(
             continue;
         }
         for path in paths {
+            // A changed path inside a folder the rules skip (the scan never
+            // entered it) stays out of the index.
+            if path
+                .ancestors()
+                .skip(1)
+                .take_while(|a| a.starts_with(&root) && *a != root)
+                .any(|a| !rules.traverse(a, &root))
+            {
+                continue;
+            }
             let depth = path
                 .strip_prefix(&root)
                 .unwrap_or(&path)
@@ -396,7 +406,12 @@ pub fn scan_into(
                         {
                             watch(item.path());
                         }
-                        if (kind == Kind::Folder || rules.include_file(item.path(), &root))
+                        let indexed = if kind == Kind::Folder {
+                            rules.index_folder(item.path(), &root)
+                        } else {
+                            rules.include_file(item.path(), &root)
+                        };
+                        if indexed
                             && !builder.push_with(
                                 item.path().as_os_str().as_bytes(),
                                 kind,

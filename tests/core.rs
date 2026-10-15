@@ -214,9 +214,10 @@ fn everything_style_functions_and_folding() {
         ["raport.pdf", "raport.pdf"]
     );
     assert_eq!(names("empty:", Sort::Name, false), ["gol"]);
+    // Names sort naturally: case and accents do not change the order.
     assert_eq!(
         names("parent:/home/Documente/", Sort::Name, false),
-        ["Rapoarte", "gol", "raport.pdf", "Știință.pdf"]
+        ["gol", "Rapoarte", "raport.pdf", "Știință.pdf"]
     );
     assert_eq!(
         names("child:raport.pdf", Sort::Name, false),

@@ -73,7 +73,7 @@ try:
         files, cache = base / 'files', base / 'cache'
         search_socket, ui_socket = socket_paths(binary, cache)
         files.mkdir()
-        for name in ['invoice.pdf', 'draft.pdf', 'notes.txt', 'main.rs', 'scratch.tmp']:
+        for name in ['invoice.pdf', 'draft.pdf', 'notes.txt', 'main.rs', 'scratch.tmp', 'exclude-me.log']:
             (files / name).write_text('fixture')
         # A Nemo action in the private data dir; File Minnow offers it for .rs files.
         marker = base / 'marker'
@@ -265,6 +265,47 @@ try:
                 break
             assert time.monotonic() < deadline, f'window size not saved: {saved}'
             time.sleep(.05)
+        # Dragging results out: a press on a row of a multiple selection keeps
+        # the selection, and the drop target receives every selected file.
+        xdo('windowfocus', '--sync', window)
+        xdo('mousemove', '--window', window, '150', '107', 'click', '1')
+        time.sleep(.2)
+        xdo('key', 'ctrl+a')
+        wait_window(lambda s: s['selected_count'] == 2)
+        dropped = base / 'dropped.txt'
+        drop = subprocess.Popen([sys.executable, str(Path(__file__).with_name('drop_fixture.py')), str(dropped), '1010', '600'], env=env, stdout=subprocess.PIPE, text=True)
+        try:
+            if not select.select([drop.stdout], [], [], 10)[0] or drop.stdout.readline().strip() != 'ready':
+                raise RuntimeError('Drop target did not start')
+            target_window = xdo('search', '--sync', '--onlyvisible', '--name', '^Minnow Drop Target$').splitlines()[0]
+            geometry = dict(line.split('=', 1) for line in xdo('getwindowgeometry', '--shell', target_window).splitlines())
+            drop_x, drop_y = int(geometry['X']) + 60, int(geometry['Y']) + 60
+            xdo('mousemove', '--window', window, '150', '107')
+            xdo('mousedown', '1')
+            for step in range(1, 6):
+                xdo('mousemove_relative', '--', str(step * 4), str(step * 3))
+                time.sleep(.05)
+            for step in range(1, 11):
+                xdo('mousemove', str(drop_x - 10 + step), str(drop_y))
+                time.sleep(.05)
+            time.sleep(.3)
+            xdo('mouseup', '1')
+            deadline = time.monotonic() + 5
+            while not dropped.exists():
+                if time.monotonic() > deadline:
+                    subprocess.run(['import', '-quiet', '-window', 'root', str(output / 'drag-failed.png')], env=env, check=True)
+                    raise AssertionError('nothing was dropped')
+                time.sleep(.05)
+            uris = sorted(dropped.read_text().split())
+            assert uris == sorted([(files / 'lib.rs').as_uri(), (files / 'main.rs').as_uri()]), uris
+            assert window_state()['selected_count'] == 2, 'dragging lost the selection'
+        finally:
+            drop.terminate()
+            drop.wait(timeout=5)
+        # A plain click on a selected row narrows the selection to it.
+        xdo('windowfocus', '--sync', window)
+        xdo('mousemove', '--window', window, '150', '107', 'click', '1')
+        wait_window(lambda s: s['selected_count'] == 1)
         # File manager items in the right-click menu (first row: lib.rs).
         def right_click_first(key):
             xdo('windowfocus', '--sync', window)
@@ -461,7 +502,23 @@ try:
         wait_window(lambda s: s['query'] == scope + 'invoice' and s['matches'] == 1)
         xdo('key', 'ctrl+l', 'BackSpace')
         wait_window(lambda s: s['query'] == '')
-        menu_checks = {'bookmarks_menu': True, 'custom_filter': True, 'export_csv': True, 'view_menu_remembered': True, 'show_in_folder_scope': True, 'search_here_cursor_after_folder': True, 'empty_until_search': True, 'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
+        menu_checks = {'drag_out_selection': True, 'bookmarks_menu': True, 'custom_filter': True, 'export_csv': True, 'view_menu_remembered': True, 'show_in_folder_scope': True, 'search_here_cursor_after_folder': True, 'empty_until_search': True, 'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
+        # Right-click > Exclude from Index drops the entry and lists the path
+        # in the exclusions.
+        xdo('windowfocus', '--sync', window)
+        xdo('key', 'ctrl+l')
+        xdo('type', '--delay', '10', 'exclude-me')
+        wait_window(lambda s: s['query'] == 'exclude-me' and s['matches'] == 1)
+        xdo('mousemove', '--window', window, '150', '107', 'click', '1')
+        time.sleep(.2)
+        xdo('mousemove', '--window', window, '150', '107', 'click', '3')
+        time.sleep(.3)
+        xdo('key', 'x')
+        wait_window(lambda s: s['query'] == 'exclude-me' and s['matches'] == 0)
+        assert str(files / 'exclude-me.log') in request({'command': 'settings'})['settings']['index']['excluded_folders']
+        menu_checks['exclude_from_index'] = True
+        xdo('key', 'ctrl+l', 'BackSpace')
+        wait_window(lambda s: s['query'] == '')
         # Excluded file types: the default list hides *.tmp.
         assert request({'command': 'search', 'query': 'scratch', 'sort': 'Name', 'descending': False, 'limit': 10, 'offset': 0})['search']['total'] == 0, 'default file types were indexed'
         xdo('windowfocus', '--sync', window)

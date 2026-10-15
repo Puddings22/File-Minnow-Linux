@@ -616,27 +616,23 @@ fn folders(dialog: &gtk::Dialog, draft: Rc<RefCell<Settings>>, error: gtk::Label
     }
     page
 }
-fn exclusions(dialog: &gtk::Dialog, draft: Rc<RefCell<Settings>>) -> gtk::Box {
-    let page = page();
-    let hidden = gtk::CheckButton::with_label("Exclude hidden files and folders");
-    hidden.set_active(draft.borrow().index.exclude_hidden);
-    page.pack_start(&hidden, false, false, 0);
-    {
-        let d = draft.clone();
-        hidden.connect_toggled(move |b| d.borrow_mut().index.exclude_hidden = b.is_active());
-    }
-    page.pack_start(&caption("Excluded folders"), false, false, 0);
+/// A list of folders in the draft settings with Add and Remove buttons.
+fn folder_list(
+    dialog: &gtk::Dialog,
+    draft: &Rc<RefCell<Settings>>,
+    chooser_title: &'static str,
+    folders: fn(&mut Settings) -> &mut Vec<RawPath>,
+) -> (gtk::ScrolledWindow, gtk::Box) {
     let (scroll, tree, store) = list();
-    for path in &draft.borrow().index.excluded_folders {
+    scroll.set_min_content_height(90);
+    for path in folders(&mut draft.borrow_mut()).iter() {
         store.insert_with_values(None, &[(0, &path.display())]);
     }
-    page.pack_start(&scroll, true, true, 0);
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let add = gtk::Button::with_label("Add Folder…");
     let remove = gtk::Button::with_label("Remove");
     row.pack_start(&add, false, false, 0);
     row.pack_start(&remove, false, false, 0);
-    page.pack_start(&row, false, false, 0);
     {
         let parent = dialog.clone();
         let d = draft.clone();
@@ -644,10 +640,10 @@ fn exclusions(dialog: &gtk::Dialog, draft: Rc<RefCell<Settings>>) -> gtk::Box {
         add.connect_clicked(move |_| {
             let d = d.clone();
             let model = model.clone();
-            chooser(&parent, "Exclude Folder", move |paths| {
+            chooser(&parent, chooser_title, move |paths| {
                 for path in paths {
                     let raw = RawPath::new(&path);
-                    d.borrow_mut().index.excluded_folders.push(raw.clone());
+                    folders(&mut d.borrow_mut()).push(raw.clone());
                     model.insert_with_values(None, &[(0, &raw.display())]);
                 }
             });
@@ -657,13 +653,53 @@ fn exclusions(dialog: &gtk::Dialog, draft: Rc<RefCell<Settings>>) -> gtk::Box {
         let d = draft.clone();
         remove.connect_clicked(move |_| {
             if let Some(i) = chosen(&tree) {
-                d.borrow_mut().index.excluded_folders.remove(i);
+                folders(&mut d.borrow_mut()).remove(i);
                 if let Some((_, iter)) = tree.selection().selected() {
                     store.remove(&iter);
                 }
             }
         });
     }
+    (scroll, row)
+}
+fn exclusions(dialog: &gtk::Dialog, draft: Rc<RefCell<Settings>>) -> gtk::Box {
+    let page = page();
+    let hidden = gtk::CheckButton::with_label("Exclude hidden files and folders");
+    hidden.set_active(draft.borrow().index.exclude_hidden);
+    page.pack_start(&hidden, false, false, 0);
+    {
+        let d = draft.clone();
+        hidden.connect_toggled(move |b| d.borrow_mut().index.exclude_hidden = b.is_active());
+    }
+    let snapshots = gtk::CheckButton::with_label("Skip snapshot and system image folders");
+    snapshots.set_tooltip_text(Some(&format!(
+        "They hold extra copies of other files: Timeshift, Snapper and ZFS snapshots, snap packages, the Nix store, Flatpak and Podman storage.\n\n{}\nand any folder named {}",
+        config::SNAPSHOT_PATHS.join(", "),
+        config::SNAPSHOT_FOLDERS.join(", ")
+    )));
+    snapshots.set_active(draft.borrow().index.exclude_snapshots);
+    page.pack_start(&snapshots, false, false, 0);
+    {
+        let d = draft.clone();
+        snapshots.connect_toggled(move |b| d.borrow_mut().index.exclude_snapshots = b.is_active());
+    }
+    page.pack_start(&caption("Excluded folders and files"), false, false, 0);
+    let (scroll, row) = folder_list(dialog, &draft, "Exclude Folder", |s| {
+        &mut s.index.excluded_folders
+    });
+    page.pack_start(&scroll, true, true, 0);
+    page.pack_start(&row, false, false, 0);
+    page.pack_start(
+        &caption("Always index these folders, even inside an excluded or hidden folder"),
+        false,
+        false,
+        0,
+    );
+    let (scroll, row) = folder_list(dialog, &draft, "Always Index Folder", |s| {
+        &mut s.index.included_folders
+    });
+    page.pack_start(&scroll, true, true, 0);
+    page.pack_start(&row, false, false, 0);
     for (title, include) in [
         (
             "Include only files (one pattern per line; empty includes all)",
@@ -1123,5 +1159,115 @@ fn appearance(draft: Rc<RefCell<Settings>>, autostart: Rc<Cell<bool>>) -> gtk::B
         false,
         4,
     );
+    page.pack_start(&search_here(), false, false, 8);
     page
+}
+/// "Search Here with File Minnow" in the folder menus of the installed file
+/// managers: added or removed at once, for this user only.
+fn search_here() -> gtk::Box {
+    use crate::integrations::{Locations, MANAGERS};
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    section.pack_start(
+        &caption("“Search Here with File Minnow” in the folder menu of your file manager:"),
+        false,
+        false,
+        0,
+    );
+    if crate::file_ops::confined() {
+        section.pack_start(
+            &caption("Not available in the snap package, which cannot change other applications' settings."),
+            false,
+            false,
+            0,
+        );
+        return section;
+    }
+    let at = Rc::new(Locations::from_env());
+    let grid = gtk::Grid::new();
+    grid.set_row_spacing(4);
+    grid.set_column_spacing(12);
+    let mut rows = 0;
+    let mut reload = false;
+    for manager in MANAGERS {
+        let state = manager.state(&at);
+        if !state.available && !state.user {
+            continue;
+        }
+        reload |= matches!(
+            manager,
+            crate::integrations::Manager::Thunar | crate::integrations::Manager::Dolphin
+        );
+        let name = gtk::Label::new(Some(manager.label()));
+        name.set_xalign(0.);
+        let status = gtk::Label::new(None);
+        status.set_xalign(0.);
+        let button = gtk::Button::new();
+        let show = {
+            let (status, button) = (status.clone(), button.clone());
+            move |state: &crate::integrations::State| {
+                if state.user {
+                    status.set_text("Added for you");
+                    button.set_label("Remove");
+                    button.show();
+                } else if state.system {
+                    status.set_text("Added by the package");
+                    button.hide();
+                } else {
+                    status.set_text("Not added");
+                    button.set_label("Add");
+                    button.show();
+                }
+            }
+        };
+        let at = at.clone();
+        let refresh = show.clone();
+        button.connect_clicked(move |button| {
+            let state = manager.state(&at);
+            let result = if state.user {
+                manager.uninstall(&at)
+            } else {
+                manager.install(&at)
+            };
+            refresh(&manager.state(&at));
+            if let Err(e) = result {
+                let parent = button
+                    .toplevel()
+                    .and_then(|w| w.downcast::<gtk::Window>().ok());
+                let dialog = gtk::MessageDialog::new(
+                    parent.as_ref(),
+                    gtk::DialogFlags::MODAL | gtk::DialogFlags::DESTROY_WITH_PARENT,
+                    gtk::MessageType::Error,
+                    gtk::ButtonsType::Close,
+                    &format!("Cannot change {}: {e}", manager.label()),
+                );
+                dialog.connect_response(|d, _| d.close());
+                dialog.show();
+            }
+        });
+        grid.attach(&name, 0, rows, 1, 1);
+        grid.attach(&status, 1, rows, 1, 1);
+        grid.attach(&button, 2, rows, 1, 1);
+        button.set_no_show_all(true);
+        show(&state);
+        rows += 1;
+    }
+    if rows == 0 {
+        section.pack_start(
+            &caption("No supported file manager was found."),
+            false,
+            false,
+            0,
+        );
+    } else {
+        section.pack_start(&grid, false, false, 0);
+    }
+    if reload {
+        section.pack_start(
+            &caption("Thunar and Dolphin may need to be restarted to show the change."),
+            false,
+            false,
+            0,
+        );
+    }
+    section
 }

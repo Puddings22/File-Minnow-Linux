@@ -1,5 +1,5 @@
 use crate::{
-    config::{ConfigStore, IndexConfig, PatternRules, RootConfig, Settings},
+    config::{ConfigStore, IndexConfig, PatternRules, RawPath, RootConfig, Settings},
     index::{self, Snapshot},
     mounts, store,
     watch::{Signal, Watcher},
@@ -382,6 +382,37 @@ impl Worker {
         }
     }
 }
+/// When `next` only adds roots, excluded paths or exception folders to
+/// `config`, the paths whose index entries change; otherwise none.
+fn added_paths(config: &IndexConfig, next: &IndexConfig) -> Vec<PathBuf> {
+    let mut trimmed = next.clone();
+    trimmed.roots.retain(|r| config.roots.contains(r));
+    trimmed
+        .excluded_folders
+        .retain(|p| config.excluded_folders.contains(p));
+    trimmed
+        .included_folders
+        .retain(|p| config.included_folders.contains(p));
+    if trimmed != *config {
+        return Vec::new();
+    }
+    let roots = next
+        .roots
+        .iter()
+        .filter(|r| r.enabled && !config.roots.contains(r))
+        .map(|r| r.path.path());
+    let excluded = next
+        .excluded_folders
+        .iter()
+        .filter(|p| !config.excluded_folders.contains(p))
+        .map(RawPath::path);
+    let included = next
+        .included_folders
+        .iter()
+        .filter(|p| !config.included_folders.contains(p))
+        .map(RawPath::path);
+    roots.chain(excluded).chain(included).collect()
+}
 fn config_monitors(config: &IndexConfig) -> bool {
     config.roots.iter().any(|r| r.enabled && r.monitor)
 }
@@ -484,18 +515,11 @@ impl Worker {
                     Command::Stop => break 'run,
                     Command::Settings(next) => {
                         let index_changed = next.index != config;
-                        // Roots that were only added are scanned on their own;
+                        // Added roots, exclusions and exceptions only change
+                        // their own paths, which are scanned on their own;
                         // any other change re-walks everything.
-                        let mut trimmed = next.index.clone();
-                        trimmed.roots.retain(|r| config.roots.contains(r));
-                        let added: Vec<PathBuf> = next
-                            .index
-                            .roots
-                            .iter()
-                            .filter(|r| r.enabled && !config.roots.contains(r))
-                            .map(|r| r.path.path())
-                            .collect();
-                        let only_added = trimmed == config && !added.is_empty();
+                        let added = added_paths(&config, &next.index);
+                        let only_added = !added.is_empty();
                         *self.settings.write().unwrap() = *next;
                         if index_changed {
                             config = self.settings.read().unwrap().index.clone();

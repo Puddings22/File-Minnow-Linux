@@ -260,26 +260,101 @@ fn number(text: &str) -> Result<i128> {
     }
     Ok((n * multiplier) as i128)
 }
-/// Local calendar days, matching the times shown in the results list. Day
-/// ends come from the next local midnight, so 23- and 25-hour DST days work.
+/// A date or period in local time, matching the times shown in the
+/// results list, as the first and last second it covers. Calendar periods
+/// (`today`, `thisweek`, `2026`, `2026-10`, `2026-10-15`) run from local
+/// midnight to midnight, so 23- and 25-hour DST days work; weeks start on
+/// Monday. `last7days` (or `past7days`) is a rolling period ending now.
 fn date(text: &str) -> Result<(i128, i128)> {
-    use chrono::TimeZone;
-    let today = chrono::Local::now().date_naive();
-    let d = match text {
-        "today" => today,
-        "yesterday" => today - chrono::Duration::days(1),
-        _ => chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
-            .context("Use dm:YYYY-MM-DD, today, or yesterday")?,
-    };
-    let midnight = |day: chrono::NaiveDate| -> Result<i128> {
+    use chrono::{Datelike, NaiveDate, TimeZone};
+    const HELP: &str = "Use a date (2026-10-15, 2026-10, 2026), today, yesterday, \
+        thisweek, lastweek, thismonth, lastmonth, thisyear, lastyear or last7days";
+    let now = chrono::Local::now();
+    let today = now.date_naive();
+    let text = text.to_ascii_lowercase();
+    let midnight = |day: NaiveDate| -> Result<i128> {
         let local = day.and_hms_opt(0, 0, 0).context("Invalid date")?;
         Ok(chrono::Local
             .from_local_datetime(&local)
             .earliest()
             .map_or_else(|| local.and_utc().timestamp(), |t| t.timestamp()) as i128)
     };
-    let next = d.succ_opt().context("Date out of range")?;
-    Ok((midnight(d)?, midnight(next)? - 1))
+    let span = |first: Option<NaiveDate>, next: Option<NaiveDate>| -> Result<(i128, i128)> {
+        let (first, next) = (
+            first.context("Date out of range")?,
+            next.context("Date out of range")?,
+        );
+        Ok((midnight(first)?, midnight(next)? - 1))
+    };
+    let month = |year: i32, month: u32| {
+        let first = NaiveDate::from_ymd_opt(year, month, 1);
+        span(
+            first,
+            first.and_then(|d| d.checked_add_months(chrono::Months::new(1))),
+        )
+    };
+    let year = |year: i32| {
+        span(
+            NaiveDate::from_ymd_opt(year, 1, 1),
+            NaiveDate::from_ymd_opt(year + 1, 1, 1),
+        )
+    };
+    let monday = today - chrono::Duration::days(i64::from(today.weekday().num_days_from_monday()));
+    let day = chrono::Duration::days(1);
+    let week = chrono::Duration::weeks(1);
+    match text.as_str() {
+        "today" => return span(Some(today), today.succ_opt()),
+        "yesterday" => return span(today.pred_opt(), Some(today)),
+        "thisweek" => return span(Some(monday), Some(monday + week)),
+        "lastweek" => return span(Some(monday - week), Some(monday)),
+        "thismonth" => return month(today.year(), today.month()),
+        "lastmonth" => {
+            let last = today.with_day(1).and_then(|d| d.pred_opt()).context(HELP)?;
+            return month(last.year(), last.month());
+        }
+        "thisyear" => return year(today.year()),
+        "lastyear" => return year(today.year() - 1),
+        _ => {}
+    }
+    if let Some(rest) = text
+        .strip_prefix("last")
+        .or_else(|| text.strip_prefix("past"))
+    {
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        let count: u32 = rest[..digits].parse().context(HELP)?;
+        let end = now.timestamp() as i128;
+        let start = match rest[digits..].trim_end_matches('s') {
+            "min" | "minute" => now - chrono::Duration::minutes(i64::from(count)),
+            "hour" => now - chrono::Duration::hours(i64::from(count)),
+            "day" => now - day * count as i32,
+            "week" => now - week * count as i32,
+            "month" => now
+                .checked_sub_months(chrono::Months::new(count))
+                .context("Date out of range")?,
+            "year" => now
+                .checked_sub_months(chrono::Months::new(count.saturating_mul(12)))
+                .context("Date out of range")?,
+            _ => bail!(HELP),
+        };
+        return Ok((start.timestamp() as i128, end));
+    }
+    let parts: Vec<&str> = text.split('-').collect();
+    let number = |s: &str| {
+        s.parse::<u32>()
+            .ok()
+            .filter(|_| s.chars().all(|c| c.is_ascii_digit()))
+    };
+    match parts.as_slice() {
+        [y] if y.len() == 4 => year(number(y).context(HELP)? as i32),
+        [y, m] if y.len() == 4 => month(
+            number(y).context(HELP)? as i32,
+            number(m).filter(|m| (1..=12).contains(m)).context(HELP)?,
+        ),
+        _ => {
+            let d = NaiveDate::parse_from_str(&text, "%Y-%m-%d").context(HELP)?;
+            span(Some(d), d.succ_opt())
+        }
+    }
 }
 fn range(text: &str, is_date: bool) -> Result<Range> {
     let val = |s: &str| -> Result<(i128, i128)> {
@@ -1390,7 +1465,7 @@ pub fn search(
                     folder(a)
                         .cmp(&folder(b))
                         .then_with(|| lower(a).cmp(lower(b)))
-                        .then_with(|| table.name(a).cmp(table.name(b)))
+                        .then_with(|| crate::table::name_cmp(table.name(a), table.name(b)))
                 };
                 let compare = |a: &u32, b: &u32| {
                     let order = if request.sort == Sort::Type {
@@ -1555,5 +1630,60 @@ mod tests {
         bits.set(3);
         bits.set(69);
         assert_eq!(bits.ones_iter().collect::<Vec<_>>(), [3, 69]);
+    }
+
+    #[test]
+    fn date_words_and_periods() {
+        use chrono::{Datelike, Local, NaiveDate, TimeZone};
+        let at = |y, m, d| {
+            Local
+                .from_local_datetime(
+                    &NaiveDate::from_ymd_opt(y, m, d)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap(),
+                )
+                .earliest()
+                .unwrap()
+                .timestamp() as i128
+        };
+        assert_eq!(date("2026").unwrap(), (at(2026, 1, 1), at(2027, 1, 1) - 1));
+        assert_eq!(
+            date("2024-02").unwrap(),
+            (at(2024, 2, 1), at(2024, 3, 1) - 1)
+        );
+        assert_eq!(
+            date("2026-10-15").unwrap(),
+            (at(2026, 10, 15), at(2026, 10, 16) - 1)
+        );
+        let today = Local::now().date_naive();
+        let now = Local::now().timestamp() as i128;
+        let (start, end) = date("today").unwrap();
+        assert!(start <= now && now <= end);
+        for word in ["thisweek", "thismonth", "THISYEAR"] {
+            let (start, end) = date(word).unwrap();
+            assert!(start <= now && now <= end, "{word}");
+        }
+        let (week_start, _) = date("thisweek").unwrap();
+        assert_eq!(date("lastweek").unwrap().1, week_start - 1);
+        let (month_start, _) = date("thismonth").unwrap();
+        assert_eq!(date("lastmonth").unwrap().1, month_start - 1);
+        assert_eq!(date("lastyear").unwrap().0, at(today.year() - 1, 1, 1));
+        let (start, end) = date("last7days").unwrap();
+        assert!(
+            (end - start - 7 * 86400).abs() <= 3600,
+            "a DST change shifts by an hour at most"
+        );
+        assert!((end - now).abs() <= 2);
+        assert!(date("past2hours").unwrap().0 >= now - 2 * 3600 - 2);
+        for bad in ["lastfortnight", "last7", "2026-13", "20261", "someday"] {
+            assert!(date(bad).is_err(), "{bad}");
+        }
+        // Periods combine with comparisons and ranges.
+        let q = Query::parse("dm:>=thismonth").unwrap();
+        let recent = Entry::new(b"/a".to_vec(), Kind::File, 1, now as i64);
+        let old = Entry::new(b"/b".to_vec(), Kind::File, 1, (month_start - 1) as i64);
+        assert!(q.matches(&recent) && !q.matches(&old));
+        assert!(Query::parse("dc:2025..lastmonth").is_ok());
     }
 }

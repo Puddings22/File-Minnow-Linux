@@ -317,3 +317,56 @@ fn offline_roots_keep_their_entries_and_added_roots_scan_alone() {
         "added root caused a full rescan: {status:?}"
     );
 }
+
+#[test]
+fn exclusions_and_exceptions_added_while_running() {
+    let (_temp, root, dir, config, settings) = setup();
+    for sub in ["cache/keep/this", "cache/other", "docs"] {
+        fs::create_dir_all(root.join(sub)).unwrap();
+    }
+    fs::write(root.join("cache/keep/this/wanted.txt"), b"x").unwrap();
+    fs::write(root.join("cache/keep/stray.txt"), b"x").unwrap();
+    fs::write(root.join("cache/other/junk.txt"), b"x").unwrap();
+    fs::write(root.join("docs/letter.txt"), b"x").unwrap();
+    let runtime = Runtime::configured(settings, dir, config).unwrap();
+    wait(&runtime, |s, _| has(s, b"junk.txt"));
+    // Excluding a folder and a single file drops just those entries.
+    let mut next = runtime.handle.settings();
+    next.index.excluded_folders = vec![
+        RawPath::new(&root.join("cache")),
+        RawPath::new(&root.join("docs/letter.txt")),
+    ];
+    runtime.handle.apply_settings(next).unwrap();
+    wait(&runtime, |s, _| {
+        !has(s, b"junk.txt") && !has(s, b"letter.txt")
+    });
+    assert!(has(&runtime.state.read().unwrap().snapshot, b"docs"));
+    // An exception inside the excluded folder brings back only itself.
+    let mut next = runtime.handle.settings();
+    next.index.included_folders = vec![RawPath::new(&root.join("cache/keep/this"))];
+    runtime.handle.apply_settings(next).unwrap();
+    wait(&runtime, |s, _| has(s, b"wanted.txt"));
+    let s = runtime.state.read().unwrap();
+    for absent in [
+        b"stray.txt".as_slice(),
+        b"junk.txt",
+        b"cache",
+        b"keep",
+        b"letter.txt",
+    ] {
+        assert!(
+            !has(&s.snapshot, absent),
+            "{}",
+            String::from_utf8_lossy(absent)
+        );
+    }
+    assert!(has(&s.snapshot, b"this"));
+    drop(s);
+    // A full rescan agrees with the incremental updates.
+    let before = runtime.handle.status().generation;
+    runtime.handle.rescan(None).unwrap();
+    wait(&runtime, |s, _| s.generation > before);
+    let s = runtime.state.read().unwrap();
+    assert!(has(&s.snapshot, b"wanted.txt") && !has(&s.snapshot, b"stray.txt"));
+    assert!(!has(&s.snapshot, b"keep") && !has(&s.snapshot, b"letter.txt"));
+}

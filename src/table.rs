@@ -117,6 +117,130 @@ pub fn path_cmp(a: &[u8], b: &[u8]) -> Ordering {
     a.len().cmp(&b.len())
 }
 
+/// Appends a name's natural sort key, whose byte order is the natural name
+/// order: ASCII letters lowercased, and each run of digits replaced by its
+/// length without leading zeros, then those digits, so `2` sorts before
+/// `10`. Lengths of 1 to 8 are the bytes `1` to `8`; longer runs are `9`
+/// and a length byte. Digits keep their place among other characters this
+/// way, and key bytes are never zero, so a zero-padded prefix stands for
+/// the key. `name` must be ASCII or already folded (`natural_source`).
+fn push_natural_key(name: &[u8], out: &mut Vec<u8>) {
+    let mut at = 0;
+    while at < name.len() {
+        let c = name[at];
+        if !c.is_ascii_digit() {
+            out.push(c.to_ascii_lowercase());
+            at += 1;
+            continue;
+        }
+        let (start, end) = digit_run(name, at);
+        let first = run_first_byte(name, at);
+        out.push(first);
+        if first == b'9' {
+            out.push(run_length(start, end) as u8);
+        }
+        out.extend_from_slice(&name[start..end]);
+        at = end;
+    }
+}
+/// The run of digits starting at `at`: the digits without leading zeros
+/// (keeping at least one) and the end of the run.
+fn digit_run(name: &[u8], at: usize) -> (usize, usize) {
+    let end = at + name[at..].iter().take_while(|b| b.is_ascii_digit()).count();
+    let mut start = at;
+    while start + 1 < end && name[start] == b'0' {
+        start += 1;
+    }
+    (start, end)
+}
+fn run_length(start: usize, end: usize) -> usize {
+    (end - start).min(255)
+}
+/// The first key byte of the run of digits at `at`.
+fn run_first_byte(name: &[u8], at: usize) -> u8 {
+    let (start, end) = digit_run(name, at);
+    match run_length(start, end) {
+        length @ 1..=8 => b'0' + length as u8,
+        _ => b'9',
+    }
+}
+/// A name in the form its natural key is built from: non-ASCII names are
+/// folded, so accents and case do not change where they sort.
+fn natural_source(name: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if name.is_ascii() {
+        std::borrow::Cow::Borrowed(name)
+    } else {
+        std::borrow::Cow::Owned(crate::fold::fold(name))
+    }
+}
+fn natural_key(name: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(name.len() + 8);
+    push_natural_key(&natural_source(name), &mut key);
+    key
+}
+/// Compares the natural keys of two names without building them. ASCII
+/// text is compared in place; at the first non-ASCII byte the keys of both
+/// (folded) names are built and compared.
+fn natural_key_cmp(a: &[u8], b: &[u8]) -> Ordering {
+    let (mut i, mut j) = (0, 0);
+    loop {
+        let (Some(&x), Some(&y)) = (a.get(i), b.get(j)) else {
+            return (a.len() - i).min(1).cmp(&(b.len() - j).min(1));
+        };
+        if !x.is_ascii() || !y.is_ascii() {
+            return natural_key(a).cmp(&natural_key(b));
+        }
+        match (x.is_ascii_digit(), y.is_ascii_digit()) {
+            (true, true) => {
+                let (sa, ea) = digit_run(a, i);
+                let (sb, eb) = digit_run(b, j);
+                let order = run_length(sa, ea)
+                    .cmp(&run_length(sb, eb))
+                    .then_with(|| a[sa..ea].cmp(&b[sb..eb]));
+                if order.is_ne() {
+                    return order;
+                }
+                (i, j) = (ea, eb);
+            }
+            // A run's first key byte is a digit, compared with the other
+            // name's (non-digit) character.
+            (true, false) => return run_first_byte(a, i).cmp(&y.to_ascii_lowercase()),
+            (false, true) => return x.to_ascii_lowercase().cmp(&run_first_byte(b, j)),
+            (false, false) => {
+                let order = x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase());
+                if order.is_ne() {
+                    return order;
+                }
+                (i, j) = (i + 1, j + 1);
+            }
+        }
+    }
+}
+/// Natural name order, as file managers sort: case- and accent-insensitive,
+/// with numbers compared by value (`IMG_2` before `IMG_10`). Names that only
+/// differ in case, accents or leading zeros fall back to their bytes, so the
+/// order is total and identical names stay next to each other.
+pub fn name_cmp(a: &[u8], b: &[u8]) -> Ordering {
+    // Skip the identical start, backing up to an ASCII character that is
+    // not a digit: a run of digits is compared as a whole number, and a
+    // multi-byte character is folded as a whole.
+    let mut same = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    if same == a.len() && same == b.len() {
+        return Ordering::Equal;
+    }
+    while same > 0 && (a[same - 1].is_ascii_digit() || !a[same - 1].is_ascii()) {
+        same -= 1;
+    }
+    natural_key_cmp(&a[same..], &b[same..]).then_with(|| a.cmp(b))
+}
+/// The first eight bytes of a natural key, zero-padded.
+fn key_prefix(key: &[u8]) -> u64 {
+    let mut prefix = [0_u8; 8];
+    let n = key.len().min(8);
+    prefix[..n].copy_from_slice(&key[..n]);
+    u64::from_be_bytes(prefix)
+}
+
 /// `path` equals `root` or lies below it.
 pub fn within(path: &[u8], root: &[u8]) -> bool {
     path.starts_with(root)
@@ -270,33 +394,60 @@ impl Table {
         }
         low
     }
-    /// Row indices sorted by name, ties in path order. Built once per table.
+    /// Row indices in natural name order (`name_cmp`), ties in path order.
+    /// Built once per table.
     pub fn name_order(&self) -> &[u32] {
         self.name_order.get_or_init(|| {
-            // Sorting fixed-size prefix keys is much faster than comparing
-            // names through the buffer; equal prefixes are then refined.
-            let prefix = |i: usize| {
-                let mut key = [0_u8; 8];
+            // Every name's natural key, built once and compared as bytes.
+            // Every name's natural key, built once and compared as bytes.
+            // Lower-case ASCII names without digits are their own key.
+            let mut keys = Vec::new();
+            let mut spans: Vec<(u32, u32)> = Vec::with_capacity(self.len());
+            for i in 0..self.len() {
                 let name = self.name(i);
-                let n = name.len().min(8);
-                key[..n].copy_from_slice(&name[..n]);
-                u64::from_be_bytes(key)
+                if name
+                    .iter()
+                    .all(|b| b.is_ascii() && !b.is_ascii_digit() && !b.is_ascii_uppercase())
+                {
+                    spans.push((u32::MAX, 0));
+                    continue;
+                }
+                let start = keys.len();
+                push_natural_key(&natural_source(name), &mut keys);
+                // Keys are about as long as the names, which fit in 4 GiB.
+                spans.push((start as u32, (keys.len() - start) as u32));
+            }
+            let own_key = |i: u32| spans[i as usize].0 == u32::MAX;
+            let key = |i: u32| match spans[i as usize] {
+                (u32::MAX, _) => self.name(i as usize),
+                (start, len) => &keys[start as usize..start as usize + len as usize],
             };
-            let mut keys: Vec<(u64, u32)> =
-                (0..self.len()).map(|i| (prefix(i), i as u32)).collect();
-            keys.sort_unstable();
-            let mut order: Vec<u32> = keys.iter().map(|k| k.1).collect();
+            // Sorting fixed-size prefixes is much faster than comparing
+            // keys through the buffer; equal prefixes are then refined.
+            let mut prefixes: Vec<(u64, u32)> = (0..self.len() as u32)
+                .map(|i| (key_prefix(key(i)), i))
+                .collect();
+            prefixes.sort_unstable();
+            let mut order: Vec<u32> = prefixes.iter().map(|k| k.1).collect();
             let mut start = 0;
-            while start < keys.len() {
+            while start < prefixes.len() {
                 let mut end = start + 1;
-                while end < keys.len() && keys[end].0 == keys[start].0 {
+                while end < prefixes.len() && prefixes[end].0 == prefixes[start].0 {
                     end += 1;
                 }
                 if end - start > 1 {
-                    order[start..end].sort_unstable_by(|a, b| {
-                        self.name(*a as usize)
-                            .cmp(self.name(*b as usize))
-                            .then(a.cmp(b))
+                    // Stable: rows with equal prefixes are in index order
+                    // already, which keeps ties in path order, and runs of
+                    // equal names (`index.js` in every package) cost one
+                    // comparison each.
+                    order[start..end].sort_by(|&a, &b| {
+                        let order = key(a).cmp(key(b));
+                        // Names that are their own key are equal when their keys are.
+                        if order.is_ne() || (own_key(a) && own_key(b)) {
+                            order
+                        } else {
+                            self.name(a as usize).cmp(self.name(b as usize))
+                        }
                     });
                 }
                 start = end;
@@ -351,9 +502,7 @@ impl Table {
             return;
         }
         let compare = |a: &u32, b: &u32| {
-            self.name(*a as usize)
-                .cmp(self.name(*b as usize))
-                .then(a.cmp(b))
+            name_cmp(self.name(*a as usize), self.name(*b as usize)).then(a.cmp(b))
         };
         let kept_order: Vec<u32> = old_order
             .iter()
@@ -730,6 +879,103 @@ mod tests {
             names(&expected, expected.name_order())
         );
         assert_eq!(spliced.entries(), expected.entries());
+    }
+    #[test]
+    fn natural_name_order() {
+        let names = [
+            "IMG_10.jpg",
+            "img_2.jpg",
+            "IMG_1.jpg",
+            "Zebra",
+            "apple",
+            "École",
+            "eclair",
+            "file02",
+            "file2",
+            "file1a",
+            "file 9",
+            "v1.10",
+            "v1.9",
+            "007",
+            "7",
+            "a",
+            "A",
+            "notes-2026-01-15.txt",
+            "notes-2026-1-2.txt",
+        ];
+        let t = table(
+            &names
+                .map(|n| format!("/d/{n}"))
+                .each_ref()
+                .map(String::as_str),
+        );
+        let sorted: Vec<_> = t
+            .name_order()
+            .iter()
+            .map(|i| String::from_utf8(t.name(*i as usize).to_vec()).unwrap())
+            .collect();
+        assert_eq!(
+            sorted,
+            [
+                "007",
+                "7",
+                "A",
+                "a",
+                "apple",
+                "eclair",
+                "École",
+                "file 9",
+                "file1a",
+                "file02",
+                "file2",
+                "IMG_1.jpg",
+                "img_2.jpg",
+                "IMG_10.jpg",
+                "notes-2026-1-2.txt",
+                "notes-2026-01-15.txt",
+                "v1.9",
+                "v1.10",
+                "Zebra"
+            ]
+        );
+        // The direct comparison agrees with the key, and prefix keys agree
+        // with the full comparison.
+        let long = "x".to_owned() + &"1".repeat(300);
+        let longer = "x".to_owned() + &"1".repeat(301);
+        let mut names = names.to_vec();
+        names.extend([
+            "x123456789",
+            "x99999999",
+            "x0000000000123",
+            long.as_str(),
+            longer.as_str(),
+            "x1y",
+            "x1Y2",
+            "Ärger 10",
+            "arger 9",
+            "a.b",
+            "a1",
+            "a_1",
+        ]);
+        for a in &names {
+            for b in &names {
+                let (ka, kb) = (natural_key(a.as_bytes()), natural_key(b.as_bytes()));
+                assert_eq!(
+                    natural_key_cmp(a.as_bytes(), b.as_bytes()),
+                    ka.cmp(&kb),
+                    "{a} {b}"
+                );
+                assert_eq!(
+                    name_cmp(a.as_bytes(), b.as_bytes()),
+                    ka.cmp(&kb).then_with(|| a.cmp(b)),
+                    "{a} {b}"
+                );
+                let (pa, pb) = (key_prefix(&ka), key_prefix(&kb));
+                if pa != pb {
+                    assert_eq!(pa.cmp(&pb), name_cmp(a.as_bytes(), b.as_bytes()), "{a} {b}");
+                }
+            }
+        }
     }
     #[test]
     fn name_order_breaks_ties_by_path() {

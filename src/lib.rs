@@ -9,6 +9,7 @@ pub mod file_ops;
 pub mod fold;
 pub mod history;
 pub mod index;
+pub mod integrations;
 pub mod mounts;
 pub mod query;
 pub mod runtime;

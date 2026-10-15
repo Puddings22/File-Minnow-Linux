@@ -155,6 +155,12 @@ impl RootConfig {
 pub struct IndexConfig {
     pub roots: Vec<RootConfig>,
     pub excluded_folders: Vec<RawPath>,
+    /// Folders indexed even though they are inside an excluded folder (or
+    /// hidden, or a snapshot folder).
+    pub included_folders: Vec<RawPath>,
+    /// Skip snapshot and system image folders (see `SNAPSHOT_FOLDERS`),
+    /// which hold whole extra copies of other files.
+    pub exclude_snapshots: bool,
     pub excluded_files: Vec<String>,
     pub included_files: Vec<String>,
     pub exclude_hidden: bool,
@@ -173,6 +179,8 @@ impl Default for IndexConfig {
         Self {
             roots: Vec::new(),
             excluded_folders: Vec::new(),
+            included_folders: Vec::new(),
+            exclude_snapshots: true,
             excluded_files: Vec::new(),
             included_files: Vec::new(),
             exclude_hidden: false,
@@ -268,7 +276,7 @@ impl IndexConfig {
                 }
             }
         }
-        for path in &self.excluded_folders {
+        for path in self.excluded_folders.iter().chain(&self.included_folders) {
             validate_path(path)?;
         }
         if self.excluded_file_types.len() > 1024 {
@@ -298,12 +306,42 @@ fn validate_path(path: &RawPath) -> Result<()> {
     Ok(())
 }
 
+/// Snapshot and system image folders, skipped unless the user turns
+/// `exclude_snapshots` off: each holds whole extra copies of other files.
+/// Absolute paths, and folder name sequences that match anywhere below a
+/// root. A root chosen inside one of them is still indexed.
+pub const SNAPSHOT_PATHS: &[&str] = &[
+    // Mounted snap packages (Ubuntu and others).
+    "/snap",
+    // The Nix store (NixOS, Nix on other distributions).
+    "/nix/store",
+    // Flatpak's object store; installed apps stay searchable.
+    "/var/lib/flatpak/repo",
+];
+pub const SNAPSHOT_FOLDERS: &[&str] = &[
+    // Snapper (openSUSE, Fedora and others with Btrfs).
+    ".snapshots",
+    // ZFS snapshots when snapdir=visible.
+    ".zfs",
+    // Timeshift on any drive, rsync and Btrfs modes.
+    "timeshift/snapshots",
+    "timeshift-btrfs/snapshots",
+    // Rootless Podman image layers.
+    ".local/share/containers/storage",
+    ".local/share/flatpak/repo",
+];
+/// The last folder names of `SNAPSHOT_FOLDERS`, checked before the rest.
+const SNAPSHOT_NAMES: &[&[u8]] = &[b".snapshots", b".zfs", b"snapshots", b"storage", b"repo"];
+
 /// Compiled once per settings change, never once per directory entry.
 pub struct PatternRules {
     excluded: GlobSet,
     included: GlobSet,
     include_active: bool,
     folders: Vec<PathBuf>,
+    /// Folders indexed although an exclusion would skip them.
+    exceptions: Vec<PathBuf>,
+    snapshots: bool,
     hidden: bool,
     /// `.ext` suffixes, lower case; empty when file types are not excluded.
     types: Vec<Vec<u8>>,
@@ -334,6 +372,8 @@ impl PatternRules {
             included: compile(&config.included_files)?,
             include_active: !config.included_files.is_empty(),
             folders: config.excluded_folders.iter().map(RawPath::path).collect(),
+            exceptions: config.included_folders.iter().map(RawPath::path).collect(),
+            snapshots: config.exclude_snapshots,
             hidden: config.exclude_hidden,
             types: if config.exclude_file_types {
                 config
@@ -346,14 +386,38 @@ impl PatternRules {
             },
         })
     }
+    /// Whether the scan enters (or, for a file, keeps) `path`. A folder
+    /// that leads to an exception is entered even when excluded, but is not
+    /// itself indexed (`index_folder`).
     pub fn traverse(&self, path: &Path, root: &Path) -> bool {
-        !self.folders.iter().any(|p| path.starts_with(p))
-            && (!self.hidden
-                || !path
+        !self.excluded(path, root) || self.leads_to_exception(path)
+    }
+    /// Whether a folder the scan entered is indexed itself.
+    pub fn index_folder(&self, path: &Path, root: &Path) -> bool {
+        !self.excluded(path, root) || self.within_exception(path)
+    }
+    /// Excluded by a folder rule, the hidden rule or the snapshot rule,
+    /// unless inside an exception. Snapshot names are only checked on the
+    /// path itself: scans never enter an excluded folder, so its contents
+    /// are not reached.
+    fn excluded(&self, path: &Path, root: &Path) -> bool {
+        if self.within_exception(path) {
+            return false;
+        }
+        self.folders.iter().any(|p| path.starts_with(p))
+            || (self.hidden
+                && path
                     .strip_prefix(root)
                     .unwrap_or(path)
                     .components()
                     .any(|part| part.as_os_str().as_bytes().starts_with(b".")))
+            || (self.snapshots && snapshot_folder(path, root))
+    }
+    fn within_exception(&self, path: &Path) -> bool {
+        self.exceptions.iter().any(|e| path.starts_with(e))
+    }
+    fn leads_to_exception(&self, path: &Path) -> bool {
+        self.exceptions.iter().any(|e| e.starts_with(path))
     }
     pub fn include_file(&self, path: &Path, root: &Path) -> bool {
         let name = Path::new(path.file_name().unwrap_or(path.as_os_str()));
@@ -366,6 +430,27 @@ impl PatternRules {
                 || self.included.is_match(name)
                 || self.included.is_match(relative))
     }
+}
+
+/// Whether `path` is a snapshot or system image folder (`SNAPSHOT_PATHS`,
+/// `SNAPSHOT_FOLDERS`) below `root`.
+fn snapshot_folder(path: &Path, root: &Path) -> bool {
+    let bytes = path.as_os_str().as_bytes();
+    if SNAPSHOT_PATHS
+        .iter()
+        .any(|p| crate::table::within(bytes, p.as_bytes()) && !root.starts_with(p))
+    {
+        return true;
+    }
+    let name = path.file_name().map_or(&b""[..], |n| n.as_bytes());
+    SNAPSHOT_NAMES.contains(&name)
+        && path != root
+        && SNAPSHOT_FOLDERS.iter().any(|folder| {
+            path.ends_with(folder)
+                && path
+                    .strip_prefix(root)
+                    .is_ok_and(|below| below.components().count() >= 1)
+        })
 }
 
 impl PatternRules {
@@ -714,5 +799,77 @@ mod tests {
         }
         cfg.excluded_file_types = vec!["TMP".into()];
         assert!(cfg.validate().is_err());
+    }
+    #[test]
+    fn snapshot_folders_and_exceptions() {
+        let rules = PatternRules::new(&IndexConfig::default()).unwrap();
+        let root = Path::new("/");
+        for skipped in [
+            "/snap",
+            "/snap/firefox/123",
+            "/nix/store",
+            "/timeshift/snapshots",
+            "/media/alex/Backup/timeshift/snapshots",
+            "/.snapshots",
+            "/home/.snapshots",
+            "/tank/data/.zfs",
+            "/home/alex/.local/share/containers/storage",
+            "/var/lib/flatpak/repo",
+        ] {
+            assert!(!rules.traverse(Path::new(skipped), root), "{skipped}");
+        }
+        for kept in [
+            "/snapshots",
+            "/home/alex/snap",
+            "/home/alex/snapshots",
+            "/timeshift",
+            "/home/alex/projects/repo",
+            "/var/lib/flatpak/app",
+            "/nix",
+        ] {
+            assert!(rules.traverse(Path::new(kept), root), "{kept}");
+        }
+        // A root chosen inside one is indexed.
+        assert!(rules.traverse(Path::new("/snap/app/1"), Path::new("/snap/app")));
+        assert!(rules.traverse(
+            Path::new("/timeshift/snapshots/x"),
+            Path::new("/timeshift/snapshots")
+        ));
+        let off = IndexConfig {
+            exclude_snapshots: false,
+            ..Default::default()
+        };
+        assert!(
+            PatternRules::new(&off)
+                .unwrap()
+                .traverse(Path::new("/snap"), root)
+        );
+        // Exceptions inside an excluded or hidden folder: the way there is
+        // walked but not indexed, the exception and its contents are.
+        let cfg = IndexConfig {
+            excluded_folders: vec![RawPath(b"/home/a/cache".to_vec())],
+            included_folders: vec![
+                RawPath(b"/home/a/cache/keep/this".to_vec()),
+                RawPath(b"/home/a/.config/app".to_vec()),
+            ],
+            exclude_hidden: true,
+            ..Default::default()
+        };
+        let rules = PatternRules::new(&cfg).unwrap();
+        let root = Path::new("/home/a");
+        let check = |path: &str| {
+            let path = Path::new(path);
+            (rules.traverse(path, root), rules.index_folder(path, root))
+        };
+        assert_eq!(check("/home/a/cache"), (true, false));
+        assert_eq!(check("/home/a/cache/keep"), (true, false));
+        assert_eq!(check("/home/a/cache/other"), (false, false));
+        assert_eq!(check("/home/a/cache/keep/file.txt"), (false, false));
+        assert_eq!(check("/home/a/cache/keep/this"), (true, true));
+        assert_eq!(check("/home/a/cache/keep/this/deep/x.txt"), (true, true));
+        assert_eq!(check("/home/a/.config"), (true, false));
+        assert_eq!(check("/home/a/.config/app/.hidden"), (true, true));
+        assert_eq!(check("/home/a/.config/other"), (false, false));
+        assert_eq!(check("/home/a/docs"), (true, true));
     }
 }

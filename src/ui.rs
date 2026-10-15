@@ -1066,6 +1066,14 @@ fn x11_id(window: &gtk::Window) -> Option<u32> {
     let xid = unsafe { gdk_x11_window_get_xid(surface.to_glib_none().0) };
     u32::try_from(xid).ok()
 }
+/// Selects every result. The selection handler updates the app, so the app
+/// must not be borrowed while the selection changes.
+fn select_all(w: &AppWeak) {
+    let tree = w.upgrade().map(|a| a.borrow().tree.clone());
+    if let Some(tree) = tree {
+        tree.selection().select_all();
+    }
+}
 fn item(menu: &gtk::Menu, label: &str, action: impl Fn() + 'static) {
     let item = gtk::MenuItem::with_mnemonic(label);
     item.connect_activate(move |_| action());
@@ -1175,9 +1183,7 @@ fn build_menus(app: &AppRef, bar: &gtk::MenuBar) {
                 item(&menu, "Copy _Name", move || {
                     with_app(&t, |a| a.copy_selected(true))
                 });
-                item(&menu, "Select _All", move || {
-                    with_app(&w, |a| a.tree.selection().select_all())
-                });
+                item(&menu, "Select _All", move || select_all(&w));
             }
             "_Search" => {
                 let t = w.clone();
@@ -1275,11 +1281,69 @@ fn build_menus(app: &AppRef, bar: &gtk::MenuBar) {
 }
 fn connect_results(app: &AppRef) {
     let tree = app.borrow().tree.clone();
+    // Results drag out as files: to a file manager (copy or move), the
+    // desktop, a browser's upload field or a mail. Set before the press
+    // handler below, which keeps a multiple selection while it is dragged.
+    tree.drag_source_set(
+        gdk::ModifierType::BUTTON1_MASK,
+        &[
+            gtk::TargetEntry::new("text/uri-list", gtk::TargetFlags::OTHER_APP, 0),
+            gtk::TargetEntry::new("text/plain;charset=utf-8", gtk::TargetFlags::OTHER_APP, 1),
+        ],
+        gdk::DragAction::COPY | gdk::DragAction::MOVE | gdk::DragAction::LINK,
+    );
+    // A press on an already selected row of a multiple selection: the
+    // selection is kept for a drag, and narrowed to that row on release.
+    let pending: Rc<RefCell<Option<gtk::TreePath>>> = Rc::default();
+    let w = Rc::downgrade(app);
+    let dragging = pending.clone();
+    tree.connect_drag_begin(move |_, context| {
+        dragging.replace(None);
+        with_app(&w, |a| {
+            let icon: gio::Icon = match a.selected_items().first() {
+                Some(item) if item.folder => gio::ThemedIcon::new("folder").upcast(),
+                Some(item) => gio::content_type_get_icon(&item.mime),
+                None => return,
+            };
+            context.drag_set_icon_gicon(&icon, 0, 0);
+        });
+    });
+    let w = Rc::downgrade(app);
+    tree.connect_drag_data_get(move |_, _, data, info, _| {
+        with_app(&w, |a| {
+            let paths = a.selected_paths();
+            if info == 0 {
+                let uris: Vec<String> = paths
+                    .iter()
+                    .map(|p| gio::File::for_path(p).uri().to_string())
+                    .collect();
+                data.set_uris(&uris.iter().map(String::as_str).collect::<Vec<_>>());
+            } else {
+                let text: Vec<String> = paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                data.set_text(&text.join("\n"));
+            }
+        })
+    });
+    let narrowing = pending.clone();
+    let release_selection = tree.selection();
+    tree.connect_button_release_event(move |tree, e| {
+        if e.button() == 1
+            && let Some(path) = narrowing.take()
+        {
+            release_selection.unselect_all();
+            tree.set_cursor(&path, None::<&gtk::TreeViewColumn>, false);
+        }
+        glib::Propagation::Proceed
+    });
     let w = Rc::downgrade(app);
     tree.connect_row_activated(move |_, _, _| with_app(&w, |a| a.open_selected(false)));
     let w = Rc::downgrade(app);
     tree.selection().connect_changed(move |_| {
         with_app(&w, |a| {
+            a.update_counts();
             a.publish();
             a.schedule_preview();
         })
@@ -1295,7 +1359,7 @@ fn connect_results(app: &AppRef) {
         match e.keyval() {
             key::c | key::C if ctrl => with_app(&w, |a| a.clipboard(false)),
             key::x | key::X if ctrl => with_app(&w, |a| a.clipboard(true)),
-            key::a | key::A if ctrl => with_app(&w, |a| a.tree.selection().select_all()),
+            key::a | key::A if ctrl => select_all(&w),
             key::Delete | key::KP_Delete if mods.is_empty() => with_app(&w, App::trash_selected),
             key::F2 if mods.is_empty() => with_app(&w, App::rename_selected),
             key::Return | key::KP_Enter if mods == gdk::ModifierType::MOD1_MASK => {
@@ -1310,6 +1374,20 @@ fn connect_results(app: &AppRef) {
     let selection = tree.selection();
     let w = Rc::downgrade(app);
     tree.connect_button_press_event(move |tree, e| {
+        let modified = e
+            .state()
+            .intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK);
+        if e.button() == 1 && e.event_type() == gdk::EventType::ButtonPress && !modified {
+            let (x, y) = e.position();
+            if let Some((Some(path), _, _, _)) = tree.path_at_pos(x as i32, y as i32)
+                && selection.path_is_selected(&path)
+                && selection.count_selected_rows() > 1
+            {
+                tree.grab_focus();
+                pending.replace(Some(path));
+                return glib::Propagation::Stop;
+            }
+        }
         if e.button() == 3 {
             let (x, y) = e.position();
             if let Some((Some(path), _, _, _)) = tree.path_at_pos(x as i32, y as i32)
@@ -1467,6 +1545,16 @@ fn popup(w: &AppWeak, event: Option<&gdk::EventButton>) {
         Some((key::Delete, none)),
         on(App::trash_selected),
     );
+    separator(&menu);
+    let exclude = menu_item(
+        &menu,
+        "E_xclude from Index",
+        None,
+        on(App::exclude_selected),
+    );
+    exclude.set_tooltip_text(Some(
+        "Leave these out of the index (files stay where they are). Undo in Options → Exclusions.",
+    ));
     separator(&menu);
     let window = app.borrow().window.clone();
     // The default file manager decides whose actions and scripts appear.
@@ -2156,21 +2244,40 @@ impl App {
         } else {
             self.status.set_tooltip_text(None);
         }
-        let counts = if let Some(r) = self.data.borrow().as_ref()
+        self.update_counts();
+        self.publish();
+    }
+    /// The counts at the right of the status bar: what is selected, then
+    /// the index and search totals.
+    fn update_counts(&mut self) {
+        let entries = self.backend.status().entries;
+        let mut counts = if let Some(r) = self.data.borrow().as_ref()
             && !self.waiting_for_search
         {
             format!(
                 "{} indexed  |  {} {}  |  {:.1} ms",
-                count(s.entries),
+                count(entries),
                 count(r.total),
                 if r.total == 1 { "match" } else { "matches" },
                 r.elapsed_ms
             )
         } else {
-            format!("{} indexed", count(s.entries))
+            format!("{} indexed", count(entries))
         };
+        let selected = self.selected();
+        if !selected.is_empty() {
+            let bytes: u64 = selected
+                .iter()
+                .filter(|e| matches!(e.kind, Kind::File | Kind::Folder))
+                .map(|e| e.size)
+                .sum();
+            counts = format!(
+                "{} selected ({})  |  {counts}",
+                count(selected.len()),
+                size(bytes)
+            );
+        }
         self.counts.set_text(&counts);
-        self.publish();
     }
     fn replace_results(&mut self, response: SearchResponse) {
         let length = response.entries.len();
@@ -2759,6 +2866,28 @@ impl App {
         } else {
             trash_paths(paths, self.messages.clone());
         }
+    }
+    /// Adds the selected files and folders to the excluded paths; the
+    /// indexer then drops just those entries.
+    fn exclude_selected(&mut self) {
+        let mut settings = self.backend.settings();
+        let before = settings.index.excluded_folders.len();
+        for path in self.selected_paths() {
+            let raw = config::RawPath::new(&path);
+            if !settings.index.excluded_folders.contains(&raw) {
+                settings.index.excluded_folders.push(raw);
+            }
+        }
+        if settings.index.excluded_folders.len() == before {
+            return;
+        }
+        self.busy("Excluding from the index…");
+        let backend = self.backend.clone();
+        let tx = self.messages.clone();
+        std::thread::spawn(move || {
+            let result = backend.apply_settings(settings).map_err(|e| e.to_string());
+            let _ = tx.send_blocking(Message::Settings(Box::new(result), false));
+        });
     }
     fn run_action(&mut self, action: &Action, window: Option<u32>) {
         let items = self.selected_items();
