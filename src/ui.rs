@@ -503,13 +503,90 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
     entry.set_margin_bottom(4);
     entry.set_hexpand(true);
     // Recent searches complete the search box (history, newest first).
-    let completion_store = gtk::ListStore::new(&[String::static_type()]);
+    // Rows: text, description, and 0 for a recent search (completes the
+    // whole box) or 1 for an operator, filter or bookmark (completes the
+    // word being typed: after `:`, or on Ctrl+Space).
+    let completion_store = gtk::ListStore::new(&[
+        String::static_type(),
+        String::static_type(),
+        i32::static_type(),
+    ]);
     let completion = gtk::EntryCompletion::new();
     completion.set_model(Some(&completion_store));
     completion.set_text_column(0);
     completion.set_inline_completion(false);
     completion.set_popup_completion(true);
     completion.set_minimum_key_length(1);
+    let described = gtk::CellRendererText::new();
+    described.set_property("foreground", "gray");
+    completion.pack_start(&described, false);
+    completion.add_attribute(&described, "text", 1);
+    let asked = Rc::new(Cell::new(false));
+    {
+        let asked = asked.clone();
+        completion.set_match_func(move |completion, key, iter| {
+            let Some(model) = completion.model() else {
+                return false;
+            };
+            let text = model
+                .value(iter, 0)
+                .get::<String>()
+                .unwrap_or_default()
+                .to_lowercase();
+            if model.value(iter, 2).get::<i32>().unwrap_or(0) == 0 {
+                return !key.is_empty() && text.starts_with(key) && text != key;
+            }
+            let word = key.rsplit(char::is_whitespace).next().unwrap_or("");
+            if let Some(wanted) = word.strip_prefix(':') {
+                let about = model
+                    .value(iter, 1)
+                    .get::<String>()
+                    .unwrap_or_default()
+                    .to_lowercase();
+                return text.contains(wanted) || about.contains(wanted);
+            }
+            asked.get() && !word.is_empty() && text.starts_with(word) && text != word
+        });
+    }
+    {
+        let asked = asked.clone();
+        let target = entry.clone();
+        completion.connect_match_selected(move |_, model, iter| {
+            asked.set(false);
+            if model.value(iter, 2).get::<i32>().unwrap_or(0) == 0 {
+                return glib::Propagation::Proceed;
+            }
+            // Replace only the word being typed.
+            let insert = model.value(iter, 0).get::<String>().unwrap_or_default();
+            let text = target.text().to_string();
+            let start = text.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+            let joined = format!("{}{insert}", &text[..start]);
+            target.set_text(&joined);
+            target.set_position(-1);
+            glib::Propagation::Stop
+        });
+    }
+    {
+        let asked = asked.clone();
+        entry.connect_changed(move |e| {
+            if e.text().ends_with(char::is_whitespace) {
+                asked.set(false);
+            }
+        });
+    }
+    {
+        let completion = completion.clone();
+        entry.connect_key_press_event(move |_, event| {
+            if event.keyval() == gdk::keys::constants::space
+                && event.state().contains(gdk::ModifierType::CONTROL_MASK)
+            {
+                asked.set(true);
+                completion.complete();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+    }
     entry.set_completion(Some(&completion));
     let filter = gtk::ComboBoxText::new();
     fill_filters(&filter, &[]);
@@ -943,6 +1020,24 @@ fn fill_filters(filter: &gtk::ComboBoxText, custom: &[config::Filter]) {
         filter.append(Some(&f.query), &f.name);
     }
 }
+/// Search operators offered while typing (after `:`, or on Ctrl+Space).
+const OPERATORS: &[(&str, &str)] = &[
+    ("ext:", "file extensions: ext:pdf;docx"),
+    ("size:", "size: size:>10mb, size:1kb..2mb"),
+    ("dm:", "date modified: dm:today, dm:lastweek, dm:2026"),
+    ("dc:", "date created"),
+    ("path:", "match the whole path"),
+    ("parent:", "directly inside a folder"),
+    ("child:", "folders that contain a name"),
+    ("file:", "files only"),
+    ("folder:", "folders only"),
+    ("empty:", "empty folders"),
+    ("dupe:", "duplicates: dupe:size, dupe:content"),
+    ("content:", "text inside files (slow)"),
+    ("case:", "match case"),
+    ("ww:", "whole words"),
+    ("regex:", "regular expression"),
+];
 /// Result columns: title, default width and sort key. Name is always shown.
 const COLUMNS: [(&str, i32, Sort); 7] = [
     ("Name", 300, Sort::Name),
@@ -1843,7 +1938,27 @@ impl App {
         self.completion.clear();
         for item in self.history.items() {
             self.completion
-                .insert_with_values(None, &[(0, &item.query)]);
+                .insert_with_values(None, &[(0, &item.query), (1, &""), (2, &0)]);
+        }
+        let settings = self.backend.settings();
+        let operators = OPERATORS
+            .iter()
+            .map(|(text, about)| ((*text).to_owned(), (*about).to_owned()));
+        let types = crate::query::TYPE_FILTERS
+            .iter()
+            .map(|(label, text, _)| ((*text).to_owned(), format!("{label} files")));
+        let filters = settings
+            .ui
+            .filters
+            .iter()
+            .map(|f| (f.query.clone(), format!("Filter: {}", f.name)));
+        let bookmarks = settings
+            .bookmarks
+            .iter()
+            .map(|b| (b.query.clone(), format!("Bookmark: {}", b.name)));
+        for (text, about) in operators.chain(types).chain(filters).chain(bookmarks) {
+            self.completion
+                .insert_with_values(None, &[(0, &text), (1, &about), (2, &1)]);
         }
     }
     /// Rebuilds the Bookmarks menu and the filter drop-down when their
@@ -1872,6 +1987,7 @@ impl App {
             }
             self.bookmarks_menu.show_all();
             self.shown_bookmarks = settings.bookmarks.clone();
+            self.refresh_completion();
         }
         if settings.ui.filters != self.shown_filters {
             let active = self.filter.active_id().map(|id| id.to_string());
@@ -1882,6 +1998,7 @@ impl App {
             }
             self.filter_rebuilding.set(false);
             self.shown_filters = settings.ui.filters.clone();
+            self.refresh_completion();
         }
     }
     /// Saves the current search as a bookmark.

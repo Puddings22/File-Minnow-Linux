@@ -571,7 +571,23 @@ try:
         set_ui(open_folders_inside=False)
         xdo('key', 'ctrl+l', 'BackSpace')
         wait_window(lambda s: s['query'] == '')
-        menu_checks = {'browse_folders_inside': True, **undo_checks, 'drag_out_selection': True, 'bookmarks_menu': True, 'custom_filter': True, 'export_csv': True, 'view_menu_remembered': True, 'show_in_folder_scope': True, 'search_here_cursor_after_folder': True, 'empty_until_search': True, 'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
+        # Completion: ":" lists operators and filters, Ctrl+Space completes a word.
+        xdo('windowfocus', '--sync', window)
+        xdo('key', 'ctrl+l')
+        xdo('type', '--delay', '30', 'invoice :vid')
+        time.sleep(.5)
+        subprocess.run(['import', '-quiet', '-window', 'root', str(output / 'completion.png')], env=env, check=True)
+        xdo('key', 'Down', 'Return')
+        wait_window(lambda s: s['query'] == 'invoice video:')
+        xdo('key', 'ctrl+l', 'BackSpace')
+        xdo('type', '--delay', '30', 'ex')
+        xdo('key', 'ctrl+space')
+        time.sleep(.5)
+        xdo('key', 'Down', 'Return')
+        wait_window(lambda s: s['query'] == 'ext:')
+        xdo('key', 'ctrl+l', 'BackSpace')
+        wait_window(lambda s: s['query'] == '')
+        menu_checks = {'search_completion': True, 'browse_folders_inside': True, **undo_checks, 'drag_out_selection': True, 'bookmarks_menu': True, 'custom_filter': True, 'export_csv': True, 'view_menu_remembered': True, 'show_in_folder_scope': True, 'search_here_cursor_after_folder': True, 'empty_until_search': True, 'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
         # Right-click > Exclude from Index drops the entry and lists the path
         # in the exclusions.
         xdo('windowfocus', '--sync', window)

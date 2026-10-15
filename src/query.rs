@@ -634,6 +634,11 @@ fn term(input: &str, literal: bool) -> Result<Expr> {
             if let Some(s) = text.strip_prefix("dm:") {
                 return Ok(Expr::Date(range(s, true)?));
             }
+            if text.starts_with(':') {
+                bail!(
+                    "Choose a search operator from the list, or quote names that contain a colon"
+                );
+            }
             if text.contains(':') {
                 bail!("Unknown modifier; quote filenames containing a colon");
             }
