@@ -64,7 +64,10 @@ pub fn writer_lock(dir: &Path) -> Result<File> {
     Ok(file)
 }
 const INDEX: &str = "index.bin";
-const MAGIC: &[u8; 8] = b"FMNIDX03";
+const MAGIC: &[u8; 8] = b"FMNIDX04";
+/// The previous layout, without item counts: still read, and the counts
+/// computed on load.
+const MAGIC_03: &[u8; 8] = b"FMNIDX03";
 /// Earlier layouts of the same file; only a cache, so they are rebuilt.
 const OLD_MAGICS: [&[u8; 8]; 1] = [b"FMNIDX02"];
 /// Files from older versions. They are only a cache, so they are deleted.
@@ -172,7 +175,8 @@ impl<R: Read> Reader<R> {
     }
 }
 
-const ROW_BYTES: usize = 35;
+const ROW_BYTES: usize = 39;
+const ROW_BYTES_03: usize = 35;
 fn kind_byte(kind: Kind) -> u8 {
     match kind {
         Kind::File => 0,
@@ -219,6 +223,7 @@ pub fn save(dir: &Path, snapshot: &Snapshot) -> Result<()> {
             record[24..26].copy_from_slice(&len.to_le_bytes());
             record[26] = kind_byte(row.kind);
             record[27..35].copy_from_slice(&row.created.to_le_bytes());
+            record[35..39].copy_from_slice(&row.items.to_le_bytes());
             w.bytes(&record)?;
         }
         let sum = w.sum.0;
@@ -254,9 +259,14 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
         // A previous version's cache: start empty, the next save replaces it.
         return Ok(Snapshot::default());
     }
-    if &magic != MAGIC {
+    if &magic != MAGIC && &magic != MAGIC_03 {
         bail!("Unknown index format; it will be rebuilt");
     }
+    let row_bytes = if &magic == MAGIC {
+        ROW_BYTES
+    } else {
+        ROW_BYTES_03
+    };
     let mut r = Reader {
         input,
         sum: Checksum(0),
@@ -275,23 +285,23 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
     }
     let names = r.block()?;
     let row_count = r.u64()?;
-    if row_count.saturating_mul(ROW_BYTES as u64) != r.remaining {
+    if row_count.saturating_mul(row_bytes as u64) != r.remaining {
         bail!("Index file is inconsistent");
     }
     let mut rows = Vec::with_capacity(row_count as usize);
     let mut next_name = 0_u32;
     // Read rows in large blocks; the checksum still covers each record.
-    let mut block = vec![0_u8; ROW_BYTES * 65_536];
+    let mut block = vec![0_u8; row_bytes * 65_536];
     let mut left = row_count as usize;
     while left > 0 {
         let count = left.min(65_536);
-        let block = &mut block[..count * ROW_BYTES];
+        let block = &mut block[..count * row_bytes];
         r.input
             .read_exact(block)
             .context("Index file is truncated")?;
         r.remaining -= block.len() as u64;
         left -= count;
-        for record in block.chunks_exact(ROW_BYTES) {
+        for record in block.chunks_exact(row_bytes) {
             r.sum.update(record);
             let field = |range: std::ops::Range<usize>| &record[range];
             let size = u64::from_le_bytes(field(0..8).try_into().unwrap());
@@ -300,6 +310,11 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
             let dir = u32::from_le_bytes(field(20..24).try_into().unwrap());
             let len = u16::from_le_bytes(field(24..26).try_into().unwrap());
             let created = i64::from_le_bytes(field(27..35).try_into().unwrap());
+            let items = if row_bytes == ROW_BYTES {
+                u32::from_le_bytes(field(35..39).try_into().unwrap())
+            } else {
+                0
+            };
             let kind = match record[26] {
                 0 => Kind::File,
                 1 => Kind::Folder,
@@ -316,7 +331,7 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
             }
             next_name = offset + u32::from(len);
             rows.push(Row::from_raw(
-                size, modified, created, offset, dir, len, kind,
+                size, modified, created, offset, dir, items, len, kind,
             ));
         }
     }
@@ -332,5 +347,78 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
         bail!("Index checksum mismatch; it will be rebuilt");
     }
     snapshot.entries = Table::from_parts(names, dirs, rows);
+    if row_bytes == ROW_BYTES_03 {
+        snapshot.entries.sum_folder_sizes();
+    }
     Ok(snapshot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::Entry;
+    /// Writes `snapshot` in the 0.8 layout (FMNIDX03: no item counts).
+    fn save_03(dir: &Path, snapshot: &Snapshot) {
+        let mut out = Vec::new();
+        let mut w = Writer {
+            out: &mut out,
+            sum: Checksum(0),
+        };
+        w.out.write_all(MAGIC_03).unwrap();
+        w.block(&serde_json::to_vec(&snapshot.header()).unwrap())
+            .unwrap();
+        let (names, dirs, rows) = snapshot.entries.parts();
+        w.u64(dirs.len() as u64).unwrap();
+        for dir in dirs.iter() {
+            w.block(dir).unwrap();
+        }
+        w.block(names).unwrap();
+        w.u64(rows.len() as u64).unwrap();
+        for row in rows {
+            let (offset, len) = row.name_range();
+            let mut record = [0_u8; ROW_BYTES_03];
+            record[0..8].copy_from_slice(&row.size.to_le_bytes());
+            record[8..16].copy_from_slice(&row.modified.to_le_bytes());
+            record[16..20].copy_from_slice(&offset.to_le_bytes());
+            record[20..24].copy_from_slice(&row.dir.to_le_bytes());
+            record[24..26].copy_from_slice(&len.to_le_bytes());
+            record[26] = kind_byte(row.kind);
+            record[27..35].copy_from_slice(&row.created.to_le_bytes());
+            w.bytes(&record).unwrap();
+        }
+        let sum = w.sum.0;
+        out.extend_from_slice(&sum.to_le_bytes());
+        fs::write(dir.join(INDEX), out).unwrap();
+    }
+    #[test]
+    fn indexes_from_version_0_8_load_with_item_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry = |path: &str, kind, size| Entry::new(path.as_bytes().to_vec(), kind, size, 5);
+        let snapshot = Snapshot {
+            roots: vec![b"/d".to_vec()],
+            entries: Table::from_entries(vec![
+                entry("/d", Kind::Folder, 0),
+                entry("/d/a.txt", Kind::File, 10),
+                entry("/d/sub", Kind::Folder, 0),
+                entry("/d/sub/b.txt", Kind::File, 20),
+            ]),
+            generation: 3,
+            ..Snapshot::default()
+        };
+        save_03(temp.path(), &snapshot);
+        let old = load(temp.path()).unwrap();
+        assert_eq!(old.entries.entries(), snapshot.entries.entries());
+        assert_eq!(old.entries.row(0).items, 3);
+        assert_eq!(old.entries.row(0).size, 30);
+        save(temp.path(), &old).unwrap();
+        let mut magic = [0; 8];
+        File::open(temp.path().join(INDEX))
+            .unwrap()
+            .read_exact(&mut magic)
+            .unwrap();
+        assert_eq!(&magic, MAGIC);
+        let new = load(temp.path()).unwrap();
+        assert_eq!(new.entries.entries(), snapshot.entries.entries());
+        assert_eq!(new.generation, 3);
+    }
 }

@@ -941,6 +941,16 @@ fn search(draft: Rc<RefCell<Settings>>) -> gtk::Box {
         fresh.connect_toggled(move |b| d.borrow_mut().ui.clear_search_on_open = b.is_active());
     }
     page.pack_start(&fresh, false, false, 6);
+    let inside = gtk::CheckButton::with_label("Open folders inside File Minnow");
+    inside.set_active(draft.borrow().ui.open_folders_inside);
+    inside.set_tooltip_text(Some(
+        "Enter or a double-click on a folder lists what is in it, like a file manager. Backspace or Alt+Up goes to the parent folder, Alt+Left back. Open Containing Folder still opens the file manager.",
+    ));
+    {
+        let d = draft.clone();
+        inside.connect_toggled(move |b| d.borrow_mut().ui.open_folders_inside = b.is_active());
+    }
+    page.pack_start(&inside, false, false, 6);
     page.pack_start(&caption("Search is focused automatically whenever the window opens. Results update without fades, smooth-scroll effects or other transitions."),false,false,6);
     page.pack_start(&caption("Default matching ignores ASCII letter case. Use case: for case-sensitive matching, path: for paths, and < > to group terms. OR is evaluated before AND."),false,false,6);
     page

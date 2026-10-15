@@ -43,8 +43,9 @@ enum Expr {
     Date(Range),
     /// `dc:` creation date.
     Created(Range),
-    /// `dupe:` names that occur more than once; rows found in `prepare`.
-    Dupe(Vec<bool>),
+    /// `dupe:` results that share a name, a size or their contents with
+    /// another result of the other terms. Evaluated after them.
+    Dupe(DupeBy),
     /// `empty:` folders with nothing indexed inside.
     Empty,
     /// `parent:<folder>` entries directly inside the folder; `dir` ids found in `prepare`.
@@ -64,6 +65,140 @@ enum Expr {
         needle: Needle,
         case: bool,
     },
+}
+/// What `dupe:` compares: `dupe:` and `dupe:name` the name, `dupe:size`
+/// the size, `dupe:content` the size and then the contents; combined with
+/// `;` (`dupe:name;size`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DupeBy {
+    name: bool,
+    size: bool,
+    content: bool,
+}
+impl DupeBy {
+    fn parse(text: &str) -> Result<Self> {
+        let mut by = Self::default();
+        for part in text.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+            match part.to_ascii_lowercase().as_str() {
+                "name" => by.name = true,
+                "size" => by.size = true,
+                "content" | "contents" => by.content = true,
+                other => bail!("dupe: compares name, size or content, not “{other}”"),
+            }
+        }
+        if by == Self::default() {
+            by.name = true;
+        }
+        Ok(by)
+    }
+}
+/// Rows of `rows` that share what `by` compares with another of them.
+/// Contents are compared only within groups of equal size: first the
+/// start of each file, then whole files where the starts agree.
+fn duplicates(
+    table: &Table,
+    mut rows: Vec<usize>,
+    by: DupeBy,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Bits> {
+    let mut bits = Bits::zeros(table.len());
+    let sized = by.size || by.content;
+    if sized {
+        rows.retain(|&i| table.row(i).kind == Kind::File && table.row(i).size > 0);
+    }
+    let key = |i: usize| {
+        (
+            by.name.then(|| table.name(i)),
+            sized.then(|| table.row(i).size),
+        )
+    };
+    rows.sort_unstable_by(|&a, &b| key(a).cmp(&key(b)).then(a.cmp(&b)));
+    let hasher = (
+        std::collections::hash_map::RandomState::new(),
+        std::collections::hash_map::RandomState::new(),
+    );
+    let mut buffer = vec![0_u8; 1 << 16];
+    for group in rows.chunk_by(|&a, &b| key(a) == key(b)) {
+        if group.len() < 2 {
+            continue;
+        }
+        if !by.content {
+            group.iter().for_each(|&i| bits.set(i));
+            continue;
+        }
+        // The start of each file, then (if the files are larger) all of it.
+        let mut candidates = vec![group.to_vec()];
+        for whole in [false, true] {
+            let mut next = Vec::new();
+            for rows in candidates {
+                if whole && table.row(rows[0]).size <= buffer.len() as u64 {
+                    next.push(rows);
+                    continue;
+                }
+                let mut digests = Vec::with_capacity(rows.len());
+                for i in rows {
+                    if cancel() {
+                        bail!("Query cancelled");
+                    }
+                    if let Some(digest) = digest(table, i, whole, &hasher, &mut buffer, cancel)? {
+                        digests.push((digest, i));
+                    }
+                }
+                digests.sort_unstable();
+                for same in digests.chunk_by(|a, b| a.0 == b.0) {
+                    if same.len() > 1 {
+                        next.push(same.iter().map(|(_, i)| *i).collect());
+                    }
+                }
+            }
+            candidates = next;
+        }
+        for rows in candidates {
+            rows.iter().for_each(|&i| bits.set(i));
+        }
+    }
+    Ok(bits)
+}
+/// A 128-bit hash of the start of a file, or of all of it. None when the
+/// file cannot be read.
+fn digest(
+    table: &Table,
+    i: usize,
+    whole: bool,
+    hasher: &(
+        std::collections::hash_map::RandomState,
+        std::collections::hash_map::RandomState,
+    ),
+    buffer: &mut [u8],
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<u128>> {
+    use std::hash::{BuildHasher, Hasher};
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    let path = table.path(i);
+    let Ok(mut file) = std::fs::File::open(std::ffi::OsStr::from_bytes(&path)) else {
+        return Ok(None);
+    };
+    let (mut a, mut b) = (hasher.0.build_hasher(), hasher.1.build_hasher());
+    let mut chunks = 0_u32;
+    loop {
+        let read = match file.read(buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Ok(None),
+        };
+        a.write(&buffer[..read]);
+        b.write(&buffer[..read]);
+        if !whole {
+            break;
+        }
+        chunks += 1;
+        if chunks.is_multiple_of(64) && cancel() {
+            bail!("Query cancelled");
+        }
+    }
+    Ok(Some(u128::from(a.finish()) << 64 | u128::from(b.finish())))
 }
 /// Files larger than this are not read for `content:`.
 const CONTENT_MAX_BYTES: u64 = 16 << 20;
@@ -431,7 +566,7 @@ fn term(input: &str, literal: bool) -> Result<Expr> {
             match text {
                 "file:" => return Ok(Expr::Kind(Kind::File)),
                 "folder:" => return Ok(Expr::Kind(Kind::Folder)),
-                "dupe:" => return Ok(Expr::Dupe(Vec::new())),
+                "dupe:" => return Ok(Expr::Dupe(DupeBy::parse("")?)),
                 "empty:" => return Ok(Expr::Empty),
                 _ => {}
             }
@@ -450,6 +585,9 @@ fn term(input: &str, literal: bool) -> Result<Expr> {
                     path,
                     dirs: Vec::new(),
                 });
+            }
+            if let Some(s) = text.strip_prefix("dupe:") {
+                return Ok(Expr::Dupe(DupeBy::parse(s)?));
             }
             if let Some(s) = text.strip_prefix("child:") {
                 if s.is_empty() {
@@ -788,26 +926,6 @@ impl Expr {
                     .map(|d| contains(d, needle, *case, false))
                     .collect();
             }
-            Self::Dupe(rows) => {
-                // Equal names sit next to each other in the name order.
-                let order = table.name_order();
-                let mut dupes = vec![false; table.len()];
-                let mut start = 0;
-                while start < order.len() {
-                    let name = table.name(order[start] as usize);
-                    let mut end = start + 1;
-                    while end < order.len() && table.name(order[end] as usize) == name {
-                        end += 1;
-                    }
-                    if end - start > 1 {
-                        for i in &order[start..end] {
-                            dupes[*i as usize] = true;
-                        }
-                    }
-                    start = end;
-                }
-                *rows = dupes;
-            }
             Self::Parent { path, dirs } => {
                 *dirs = table.dirs().iter().map(|d| d == path.as_slice()).collect();
             }
@@ -871,7 +989,8 @@ impl Expr {
             Self::Size(r) => sized(e.kind()) && r.contains(e.size() as i128),
             Self::Date(r) => r.contains(e.modified() as i128),
             Self::Created(r) => e.created() != NO_DATE && r.contains(e.created() as i128),
-            Self::Dupe(rows) => e.row().is_some_and(|i| rows.get(i) == Some(&true)),
+            // Duplicates are a property of a set of results, not of one entry.
+            Self::Dupe(_) => false,
             Self::Empty => e.empty_folder(),
             Self::Parent { path, .. } => e.parent_path().as_deref() == Some(path.as_slice()),
             Self::Child { rows, .. } => e.row().is_some_and(|i| rows.get(i) == Some(&true)),
@@ -885,8 +1004,10 @@ impl Expr {
             }
         }
     }
-    fn reads_files(&self) -> bool {
-        matches!(self, Self::Content { .. })
+    /// Terms evaluated after the others of an AND, on their results:
+    /// reading files is slow, and duplicates are among those results.
+    fn evaluated_last(&self) -> bool {
+        matches!(self, Self::Content { .. } | Self::Dupe(_))
     }
 }
 /// Files have a size; folders carry the total of the files inside them.
@@ -1134,7 +1255,7 @@ impl Expr {
                 // Cheap terms first; terms that read files then only test
                 // the rows those left.
                 let (slow, fast): (Vec<&Expr>, Vec<&Expr>) =
-                    terms.iter().partition(|t| t.reads_files());
+                    terms.iter().partition(|t| t.evaluated_last());
                 let mut bits = match fast.first() {
                     Some(first) => first.eval_within(table, candidates, cancel)?,
                     None => Bits::ones(len),
@@ -1261,8 +1382,13 @@ impl Expr {
                 let created = table.row(i).created;
                 created != NO_DATE && range.contains(created as i128)
             })?,
-            Self::Dupe(rows) | Self::Child { rows, .. } => {
-                per_row(&mut |i| rows.get(i) == Some(&true))?
+            Self::Child { rows, .. } => per_row(&mut |i| rows.get(i) == Some(&true))?,
+            Self::Dupe(by) => {
+                let rows: Vec<usize> = match candidates {
+                    Some(c) => c.ones_iter().collect(),
+                    None => (0..len).collect(),
+                };
+                duplicates(table, rows, *by, cancel)?
             }
             Self::Empty => per_row(&mut |i| table.is_empty_folder(i))?,
             Self::Parent { dirs, .. } => per_row(&mut |i| {
@@ -1356,6 +1482,8 @@ pub enum Sort {
     /// Folders first, then by extension, then by name.
     Type,
     Created,
+    /// The number of entries inside a folder.
+    Items,
 }
 /// The extension of a file name (after the last dot; none for `.hidden`).
 pub fn extension(name: &[u8]) -> &[u8] {
@@ -1444,7 +1572,7 @@ pub fn search(
                     .take(limit)
                     .collect()
             }
-            Sort::Size | Sort::Modified | Sort::Type | Sort::Created => {
+            Sort::Size | Sort::Modified | Sort::Type | Sort::Created | Sort::Items => {
                 let mut hits: Vec<u32> = match &bits {
                     Some(bits) => bits.ones_iter().map(|i| i as u32).collect(),
                     None => (0..table.len() as u32).collect(),
@@ -1454,6 +1582,7 @@ pub fn search(
                     match request.sort {
                         Sort::Size => row.size as i128,
                         Sort::Created => row.created as i128,
+                        Sort::Items => i128::from(row.items),
                         _ => row.modified as i128,
                     }
                 };

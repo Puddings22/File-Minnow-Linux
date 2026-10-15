@@ -524,10 +524,10 @@ try:
         exported = export_path.read_text().splitlines()
         assert exported[0] == 'Name,Path,Size,Modified,Created,Type' and len(exported) == 3, exported
         assert any(line.startswith('draft.pdf,') for line in exported) and all(',file' in line for line in exported[1:]), exported
-        # View menu: Preview Pane on, Created column on; both remembered.
+        # View menu: Preview Pane on, Items and Created columns on; all remembered.
         xdo('windowfocus', '--sync', window)
         xdo('mousemove', '--window', window, '150', '107', 'click', '1')
-        for keys in [['End'], ['End', 'Up']]:
+        for keys in [['End'], ['End', 'Up'], ['End', 'Up', 'Up']]:
             xdo('key', 'alt+v')
             time.sleep(.4)
             xdo('key', *keys, 'Return')
@@ -535,7 +535,8 @@ try:
         deadline = time.monotonic() + 5
         while True:
             saved = json.loads(memory_file.read_text()) if memory_file.exists() else {}
-            if saved.get('preview') is True and 'Created' not in saved.get('hidden_columns', ['Created']):
+            hidden = saved.get('hidden_columns', ['Created'])
+            if saved.get('preview') is True and 'Created' not in hidden and 'Items' not in hidden:
                 break
             assert time.monotonic() < deadline, f'view settings not saved: {saved}'
             time.sleep(.1)
@@ -551,7 +552,26 @@ try:
         wait_window(lambda s: s['query'] == scope + 'invoice' and s['matches'] == 1)
         xdo('key', 'ctrl+l', 'BackSpace')
         wait_window(lambda s: s['query'] == '')
-        menu_checks = {**undo_checks, 'drag_out_selection': True, 'bookmarks_menu': True, 'custom_filter': True, 'export_csv': True, 'view_menu_remembered': True, 'show_in_folder_scope': True, 'search_here_cursor_after_folder': True, 'empty_until_search': True, 'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
+        # Folders open inside File Minnow when asked: Enter lists the folder,
+        # Backspace goes up, Alt+Left back.
+        set_ui(open_folders_inside=True)
+        xdo('windowfocus', '--sync', window)
+        xdo('key', 'ctrl+l')
+        xdo('type', '--delay', '10', 'folder:')
+        wait_window(lambda s: s['query'] == 'folder:' and s['matches'] == 1)
+        xdo('mousemove', '--window', window, '150', '107', 'click', '1')
+        time.sleep(.2)
+        xdo('key', 'Return')
+        inside = f'parent:"{files.resolve()}"'
+        wait_window(lambda s: s['query'] == inside and s['matches'] == all_entries - 1)
+        xdo('key', 'BackSpace')
+        wait_window(lambda s: s['query'] == f'parent:"{files.resolve().parent}"' and s['matches'] == 1)
+        xdo('key', 'alt+Left')
+        wait_window(lambda s: s['query'] == inside)
+        set_ui(open_folders_inside=False)
+        xdo('key', 'ctrl+l', 'BackSpace')
+        wait_window(lambda s: s['query'] == '')
+        menu_checks = {'browse_folders_inside': True, **undo_checks, 'drag_out_selection': True, 'bookmarks_menu': True, 'custom_filter': True, 'export_csv': True, 'view_menu_remembered': True, 'show_in_folder_scope': True, 'search_here_cursor_after_folder': True, 'empty_until_search': True, 'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
         # Right-click > Exclude from Index drops the entry and lists the path
         # in the exclusions.
         xdo('windowfocus', '--sync', window)

@@ -543,3 +543,56 @@ fn startup_catch_up_reads_only_changed_folders() {
     scheduled.roots[0].schedule = file_minnow::config::Schedule::Never;
     assert_eq!(scheduled.fingerprint(), config.fingerprint());
 }
+
+#[test]
+fn duplicates_by_name_size_and_contents() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("files");
+    let cache = store::prepare(&temp.path().join("cache")).unwrap();
+    let big = |tail: u8| {
+        let mut data = vec![7_u8; 100_000];
+        data[99_999] = tail;
+        data
+    };
+    for (path, data) in [
+        ("a/x.bin", big(1)),
+        ("b/y.bin", big(1)),
+        // Same size and the same first 64 KiB, different end.
+        ("c/z.bin", big(2)),
+        ("d/x.bin", vec![1, 2, 3]),
+        ("e/empty.txt", vec![]),
+        ("f/empty.txt", vec![]),
+    ] {
+        let file = root.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, data).unwrap();
+    }
+    let s = index::scan(std::slice::from_ref(&root), &cache, 1);
+    let found = |query: &str| -> Vec<String> {
+        let request = SearchRequest {
+            query: query.into(),
+            sort: Sort::Path,
+            ..Default::default()
+        };
+        query::search(&s, &request, None)
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.path[root.as_os_str().len() + 1..]).into_owned())
+            .collect()
+    };
+    assert_eq!(found("dupe:content"), ["a/x.bin", "b/y.bin"]);
+    assert_eq!(found("dupe:size"), ["a/x.bin", "b/y.bin", "c/z.bin"]);
+    assert_eq!(
+        found("dupe:name file:"),
+        ["a/x.bin", "d/x.bin", "e/empty.txt", "f/empty.txt"]
+    );
+    assert!(
+        found("dupe:name;size").is_empty(),
+        "empty files have no size to compare"
+    );
+    // Duplicates among the other terms' results only.
+    assert_eq!(found("dupe:size !b/"), ["a/x.bin", "c/z.bin"]);
+    assert!(found("dupe:content path:a/").is_empty());
+    assert!(Query::parse("dupe:colour").is_err());
+}

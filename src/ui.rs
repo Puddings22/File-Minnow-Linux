@@ -47,9 +47,12 @@ struct WindowMemory {
     /// Preview pane shown, and its width.
     preview: bool,
     preview_width: i32,
+    /// Saved after the Items column existed; older states get it hidden.
+    #[serde(default)]
+    knows_items: bool,
 }
 fn default_hidden() -> Vec<String> {
-    vec!["Created".into()]
+    vec!["Created".into(), "Items".into()]
 }
 impl Default for WindowMemory {
     fn default() -> Self {
@@ -66,6 +69,7 @@ impl Default for WindowMemory {
             hidden_columns: default_hidden(),
             preview: false,
             preview_width: 320,
+            knows_items: true,
         }
     }
 }
@@ -76,11 +80,16 @@ impl WindowMemory {
             .with_file_name("window.json")
     }
     fn load(path: &std::path::Path) -> Self {
-        std::fs::read(path)
+        let mut memory: Self = std::fs::read(path)
             .ok()
             .filter(|bytes| bytes.len() < 64 * 1024)
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if !memory.knows_items {
+            memory.hidden_columns.push("Items".into());
+            memory.knows_items = true;
+        }
+        memory
     }
     fn usable_size(&self) -> Option<(i32, i32)> {
         ((400..=16_384).contains(&self.width) && (300..=16_384).contains(&self.height))
@@ -295,7 +304,7 @@ pub(crate) struct App {
     highlight: Rc<RefCell<Vec<Vec<u8>>>>,
     /// Roots whose drive or share is unavailable; their rows are greyed.
     offline: Rc<RefCell<Vec<Vec<u8>>>>,
-    /// Result columns in order (Name, Path, Size, Modified, Type, Created).
+    /// Result columns in order (Name, Path, Size, Modified, Type, Created, Items).
     columns: Vec<gtk::TreeViewColumn>,
     history: History,
     /// Model behind the search box's completion: the history, newest first.
@@ -319,6 +328,8 @@ pub(crate) struct App {
     /// Renames and moves to the Trash that Edit > Undo takes back, last last.
     undo: Vec<Undo>,
     undo_item: gtk::MenuItem,
+    /// Searches before each folder browsed into, for Alt+Left.
+    browse_back: Vec<String>,
 }
 impl Drop for App {
     fn drop(&mut self) {
@@ -647,6 +658,7 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
         requested_key: (String::new(), Sort::Name, false, 0),
         undo: Vec::new(),
         undo_item: gtk::MenuItem::with_mnemonic("_Undo"),
+        browse_back: Vec::new(),
     }));
     let weak = Rc::downgrade(&app);
     build_columns(&app);
@@ -932,13 +944,14 @@ fn fill_filters(filter: &gtk::ComboBoxText, custom: &[config::Filter]) {
     }
 }
 /// Result columns: title, default width and sort key. Name is always shown.
-const COLUMNS: [(&str, i32, Sort); 6] = [
+const COLUMNS: [(&str, i32, Sort); 7] = [
     ("Name", 300, Sort::Name),
     ("Path", 400, Sort::Path),
     ("Size", 95, Sort::Size),
     ("Modified", 155, Sort::Modified),
     ("Type", 140, Sort::Type),
     ("Created", 155, Sort::Created),
+    ("Items", 70, Sort::Items),
 ];
 fn build_columns(app: &AppRef) {
     let mut a = app.borrow_mut();
@@ -988,7 +1001,7 @@ fn build_columns(app: &AppRef) {
         text.set_property("single-paragraph-mode", true);
         text.set_property("ypad", 1_u32);
         text.set_property("xpad", 3_u32);
-        if number == 2 {
+        if number == 2 || number == 6 {
             text.set_property("xalign", 1_f32);
         }
         gtk::prelude::TreeViewColumnExt::pack_start(&column, &text, true);
@@ -1028,7 +1041,12 @@ fn build_columns(app: &AppRef) {
                     },
                     3 => modified(e),
                     4 => type_name(&types, e),
-                    _ => created(e),
+                    5 => created(e),
+                    // How many files and folders a folder holds, at any depth.
+                    _ => match e.kind {
+                        Kind::Folder => count(e.items as usize),
+                        _ => String::new(),
+                    },
                 };
                 cell.set_property("text", value);
             })),
@@ -1042,7 +1060,7 @@ fn build_columns(app: &AppRef) {
                     a.descending = !a.descending;
                 } else {
                     a.sort = sort;
-                    a.descending = matches!(sort, Sort::Size | Sort::Modified);
+                    a.descending = matches!(sort, Sort::Size | Sort::Modified | Sort::Items);
                 }
                 a.offset = 0;
                 a.show_sort();
@@ -1389,6 +1407,9 @@ fn connect_results(app: &AppRef) {
             key::x | key::X if ctrl => with_app(&w, |a| a.clipboard(true)),
             key::a | key::A if ctrl => select_all(&w),
             key::z | key::Z if ctrl => with_app(&w, App::undo),
+            key::BackSpace if mods.is_empty() => with_app(&w, App::browse_up),
+            key::Up if mods == gdk::ModifierType::MOD1_MASK => with_app(&w, App::browse_up),
+            key::Left if mods == gdk::ModifierType::MOD1_MASK => with_app(&w, App::browse_previous),
             key::Delete | key::KP_Delete if mods.is_empty() => with_app(&w, App::trash_selected),
             key::F2 if mods.is_empty() => with_app(&w, App::rename_selected),
             key::Return | key::KP_Enter if mods == gdk::ModifierType::MOD1_MASK => {
@@ -1529,6 +1550,17 @@ fn popup(w: &AppWeak, event: Option<&gdk::EventButton>) {
             open_with.set_submenu(Some(&submenu));
             menu.append(&open_with);
         }
+    }
+    if let [item] = items.as_slice()
+        && item.folder
+    {
+        let folder = item.path.clone();
+        let w = w.clone();
+        menu_item(&menu, "_Browse in File Minnow", None, move || {
+            with_app(&w, |a| {
+                a.browse(&folder);
+            })
+        });
     }
     menu_item(
         &menu,
@@ -2063,6 +2095,7 @@ impl App {
             Sort::Modified => "Modified",
             Sort::Type => "Type",
             Sort::Created => "Created",
+            Sort::Items => "Items",
         };
         for c in self.tree.columns() {
             c.set_sort_indicator(c.title().as_deref() == Some(title));
@@ -2715,6 +2748,15 @@ impl App {
     }
     fn open_selected(&mut self, parent: bool) {
         self.record_history();
+        if !parent && self.backend.settings().ui.open_folders_inside {
+            let selected = self.selected();
+            if let [only] = selected.as_slice()
+                && only.kind == Kind::Folder
+                && self.browse(&only.path_buf())
+            {
+                return;
+            }
+        }
         let paths = self.selected_paths();
         if paths.len() > 20 {
             self.info(
@@ -2992,6 +3034,41 @@ impl App {
             .set_label(&label.replacen("Undo", "_Undo", 1));
         self.undo_item.set_use_underline(true);
         self.undo_item.set_sensitive(!self.undo.is_empty());
+    }
+    /// The folder being browsed: the search is exactly `parent:"FOLDER"`.
+    fn browsed(&self) -> Option<PathBuf> {
+        let text = self.entry.text();
+        let folder = text.strip_prefix("parent:\"")?.strip_suffix('"')?;
+        (!folder.is_empty() && !folder.contains('"')).then(|| PathBuf::from(folder))
+    }
+    /// Lists what is in `folder` (a `parent:` search) and keeps the
+    /// results focused, like a file manager. False when the path cannot be
+    /// written as a search.
+    fn browse(&mut self, folder: &std::path::Path) -> bool {
+        let Some(text) = folder.to_str().filter(|t| !t.contains('"')) else {
+            return false;
+        };
+        self.browse_back.push(self.entry.text().into());
+        if self.browse_back.len() > 100 {
+            self.browse_back.remove(0);
+        }
+        self.set_search(&format!("parent:\"{text}\""));
+        self.tree.grab_focus();
+        true
+    }
+    fn browse_up(&mut self) {
+        if let Some(parent) = self.browsed().as_deref().and_then(std::path::Path::parent) {
+            let parent = parent.to_path_buf();
+            self.browse(&parent);
+        }
+    }
+    fn browse_previous(&mut self) {
+        if let Some(previous) = self.browse_back.pop() {
+            self.set_search(&previous);
+            if self.browsed().is_some() {
+                self.tree.grab_focus();
+            }
+        }
     }
     /// Adds the selected files and folders to the excluded paths; the
     /// indexer then drops just those entries.

@@ -18,6 +18,8 @@ pub const NO_DIR: u32 = u32::MAX;
 /// Unknown creation time (the filesystem does not record one).
 pub const NO_DATE: i64 = i64::MIN;
 
+// The item count fits in what was padding: a row stays 40 bytes.
+const _: () = assert!(std::mem::size_of::<Row>() == 40);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Row {
     /// File size, or for a folder the total size of the indexed files
@@ -28,6 +30,9 @@ pub struct Row {
     pub created: i64,
     name_offset: u32,
     pub dir: u32,
+    /// For a folder, how many indexed files and folders are inside it, at
+    /// any depth (computed by the builder); 0 otherwise.
+    pub items: u32,
     name_len: u16,
     pub kind: Kind,
 }
@@ -295,7 +300,10 @@ impl Table {
     }
     pub fn entry(&self, i: usize) -> Entry {
         let row = &self.rows[i];
-        Entry::new(self.path(i), row.kind, row.size, row.modified).created(row.created)
+        let mut entry =
+            Entry::new(self.path(i), row.kind, row.size, row.modified).created(row.created);
+        entry.items = row.items;
+        entry
     }
     /// Whether folder row `i` has no indexed entries inside it.
     pub fn is_empty_folder(&self, i: usize) -> bool {
@@ -541,12 +549,14 @@ impl Row {
     pub(crate) fn name_range(&self) -> (u32, u16) {
         (self.name_offset, self.name_len)
     }
+    #[allow(clippy::too_many_arguments)] // one per stored field
     pub(crate) fn from_raw(
         size: u64,
         modified: i64,
         created: i64,
         name_offset: u32,
         dir: u32,
+        items: u32,
         name_len: u16,
         kind: Kind,
     ) -> Self {
@@ -556,6 +566,7 @@ impl Row {
             created,
             name_offset,
             dir,
+            items,
             name_len,
             kind,
         }
@@ -661,6 +672,7 @@ impl Builder {
             created,
             name_offset,
             dir,
+            items: 0,
             name_len: name.len() as u16,
             kind,
         });
@@ -721,20 +733,28 @@ impl Builder {
 
 impl Table {
     /// Sets every folder row's size to the total size of the files inside
-    /// it. One pass in path order with a stack of open folders; a folder's
-    /// total is passed up to its parent when the walk leaves it. Rows with
-    /// the same parent are siblings, so the ancestry check runs once per
-    /// run of siblings, not once per row.
-    fn sum_folder_sizes(&mut self) {
-        // (row, path, total)
-        let mut open: Vec<(usize, Vec<u8>, u64)> = Vec::new();
+    /// it, and its item count to the number of entries inside it. One pass
+    /// in path order with a stack of open folders; a folder's totals are
+    /// passed up to its parent when the walk leaves it. Rows with the same
+    /// parent are siblings, so the ancestry check runs once per run of
+    /// siblings, not once per row.
+    pub(crate) fn sum_folder_sizes(&mut self) {
+        struct Open {
+            row: usize,
+            path: Vec<u8>,
+            size: u64,
+            items: u64,
+        }
+        let mut open: Vec<Open> = Vec::new();
         let mut current_dir = u32::MAX - 1;
         let mut dir_path: Vec<u8> = Vec::new();
-        let close = |open: &mut Vec<(usize, Vec<u8>, u64)>, rows: &mut [Row]| {
-            if let Some((row, _, total)) = open.pop() {
-                rows[row].size = total;
+        let close = |open: &mut Vec<Open>, rows: &mut [Row]| {
+            if let Some(done) = open.pop() {
+                rows[done.row].size = done.size;
+                rows[done.row].items = done.items.min(u64::from(u32::MAX)) as u32;
                 if let Some(parent) = open.last_mut() {
-                    parent.2 += total;
+                    parent.size += done.size;
+                    parent.items += done.items;
                 }
             }
         };
@@ -748,23 +768,31 @@ impl Table {
                 }
                 while open
                     .last()
-                    .is_some_and(|(_, path, _)| row.dir == NO_DIR || !within(&dir_path, path))
+                    .is_some_and(|o| row.dir == NO_DIR || !within(&dir_path, &o.path))
                 {
                     close(&mut open, &mut self.rows);
                 }
+            }
+            if let Some(parent) = open.last_mut() {
+                parent.items += 1;
             }
             match row.kind {
                 Kind::Folder => {
                     let mut path = Vec::new();
                     self.write_path(i, &mut path);
-                    open.push((i, path, 0));
+                    open.push(Open {
+                        row: i,
+                        path,
+                        size: 0,
+                        items: 0,
+                    });
                     // The next row is either this folder's first child or a
                     // later sibling: check again even if its parent id is the same.
                     current_dir = u32::MAX - 1;
                 }
                 Kind::File => {
                     if let Some(parent) = open.last_mut() {
-                        parent.2 += row.size;
+                        parent.size += row.size;
                     }
                 }
                 _ => {}
@@ -809,6 +837,12 @@ mod tests {
         assert_eq!(size_of(b"/d/sub/deep"), 1000);
         assert_eq!(size_of(b"/d/zed"), 0);
         assert_eq!(size_of(b"/e"), 7);
+        let items_of = |path: &[u8]| t.row(t.lower_bound(path)).items;
+        assert_eq!(items_of(b"/d"), 8);
+        assert_eq!(items_of(b"/d/sub"), 4);
+        assert_eq!(items_of(b"/d/zed"), 0);
+        assert_eq!(items_of(b"/d/a.txt"), 0);
+        assert_eq!(t.entry(t.lower_bound(b"/d/sub")).items, 4);
         assert!(t.is_empty_folder(t.lower_bound(b"/d/zed")));
         assert!(!t.is_empty_folder(t.lower_bound(b"/d/sub")));
         assert!(!t.is_empty_folder(t.lower_bound(b"/d/a.txt")));

@@ -59,6 +59,9 @@ pub struct Entry {
     /// Creation time (seconds), or `table::NO_DATE` when unknown.
     #[serde(default = "no_date")]
     pub created: i64,
+    /// For a folder, the number of indexed entries inside it.
+    #[serde(default)]
+    pub items: u32,
 }
 fn no_date() -> i64 {
     crate::table::NO_DATE
@@ -80,6 +83,7 @@ impl Entry {
             size,
             modified,
             created: crate::table::NO_DATE,
+            items: 0,
         }
     }
     pub fn created(mut self, created: i64) -> Self {

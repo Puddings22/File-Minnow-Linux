@@ -504,6 +504,9 @@ pub struct UiConfig {
     /// User-defined type filters (Options → Filters), shown after the
     /// built-in ones beside the search box.
     pub filters: Vec<Filter>,
+    /// Opening a folder lists it in File Minnow (`parent:` search) instead
+    /// of opening the file manager.
+    pub open_folders_inside: bool,
 }
 /// A named search that the filter drop-down adds to whatever is typed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -526,6 +529,7 @@ impl Default for UiConfig {
             history_days: 90,
             history_limit: 200,
             filters: Vec::new(),
+            open_folders_inside: false,
         }
     }
 }
