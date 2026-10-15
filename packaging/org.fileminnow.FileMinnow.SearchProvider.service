@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=org.fileminnow.FileMinnow.SearchProvider
+Exec=/usr/bin/file-minnow search-provider

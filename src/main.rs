@@ -93,9 +93,12 @@ enum Command {
     WindowStatus,
     /// Print where this data directory's index, settings and sockets are
     Paths,
+    /// Answer GNOME Shell and KRunner searches over D-Bus (started by D-Bus)
+    SearchProvider,
 }
 fn main() -> Result<()> {
     let args = Args::parse();
+    let custom_dir = args.data_dir.clone();
     let dir = store::prepare(&args.data_dir.unwrap_or_else(store::default_dir))?;
     match args.command.unwrap_or(Command::Gui {
         root: Vec::new(),
@@ -306,6 +309,15 @@ fn main() -> Result<()> {
             )?;
             #[cfg(not(feature = "gui"))]
             bail!("Built without GUI support");
+        }
+        Command::SearchProvider => {
+            #[cfg(feature = "gui")]
+            file_minnow::search_provider::serve(&dir, custom_dir)?;
+            #[cfg(not(feature = "gui"))]
+            {
+                let _ = custom_dir;
+                bail!("Built without GUI support");
+            }
         }
         Command::Paths => {
             println!(

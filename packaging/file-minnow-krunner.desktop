@@ -1,0 +1,15 @@
+[Desktop Entry]
+Name=File Minnow
+Comment=Files and folders from File Minnow's index
+Type=Service
+Icon=file-minnow
+X-KDE-PluginInfo-Author=File Minnow contributors
+X-KDE-PluginInfo-Name=file-minnow
+X-KDE-PluginInfo-Version=1.0
+X-KDE-PluginInfo-License=MIT
+X-KDE-PluginInfo-EnabledByDefault=true
+X-Plasma-API=DBus
+X-Plasma-DBusRunner-Service=org.fileminnow.FileMinnow.SearchProvider
+X-Plasma-DBusRunner-Path=/org/fileminnow/FileMinnow/KRunner
+X-Plasma-Runner-Min-Letter-Count=3
+X-Plasma-Request-Actions-Once=true

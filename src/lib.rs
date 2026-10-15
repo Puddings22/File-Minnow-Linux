@@ -16,6 +16,8 @@ pub mod rename;
 #[cfg(feature = "gui")]
 pub mod rename_ui;
 pub mod runtime;
+#[cfg(feature = "gui")]
+pub mod search_provider;
 pub mod service;
 #[cfg(feature = "gui")]
 pub mod settings_ui;
