@@ -95,6 +95,16 @@ enum Command {
     Paths,
     /// Answer GNOME Shell and KRunner searches over D-Bus (started by D-Bus)
     SearchProvider,
+    /// Show what changed in the indexed folders, newest first
+    Changes {
+        /// How far back: minutes, hours, days or weeks (30m, 12h, 7d, 2w)
+        #[arg(long, default_value = "1d")]
+        since: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
 }
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -309,6 +319,51 @@ fn main() -> Result<()> {
             )?;
             #[cfg(not(feature = "gui"))]
             bail!("Built without GUI support");
+        }
+        Command::Changes { since, limit, json } => {
+            let digits = since.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+            let amount: i64 = digits.parse().map_err(|_| {
+                anyhow::anyhow!("Use --since with a number and m, h, d or w (such as 7d)")
+            })?;
+            let unit = match &since[digits.len()..] {
+                "m" | "min" => 60,
+                "h" => 3600,
+                "" | "d" => 86_400,
+                "w" => 7 * 86_400,
+                other => bail!("Unknown unit {other}: use m, h, d or w"),
+            };
+            let from = index::now() as i64 - amount.saturating_mul(unit);
+            let changes: Vec<_> = file_minnow::journal::Journal::new(&dir)
+                .read(from)
+                .into_iter()
+                .take(limit)
+                .collect();
+            let mut out = std::io::stdout().lock();
+            if json {
+                serde_json::to_writer_pretty(&mut out, &changes)?;
+                writeln!(out)?;
+            } else {
+                use chrono::TimeZone;
+                for c in changes {
+                    let time = chrono::Local
+                        .timestamp_opt(c.time, 0)
+                        .earliest()
+                        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_default();
+                    match &c.to {
+                        Some(to) => writeln!(
+                            out,
+                            "{time}  {:<8} {} → {}",
+                            c.label(),
+                            c.path.display(),
+                            to.display()
+                        )?,
+                        None => {
+                            writeln!(out, "{time}  {:<8} {}", c.action.label(), c.path.display())?
+                        }
+                    }
+                }
+            }
         }
         Command::SearchProvider => {
             #[cfg(feature = "gui")]

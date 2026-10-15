@@ -517,6 +517,8 @@ impl Worker {
             ];
         }
         watch_mounts(self.tx.clone(), thread::current(), self.stop.clone());
+        let journal = crate::journal::Journal::new(dir);
+        let _ = journal.trim(index::now() as i64);
         state.write().unwrap().status.offline = index::offline_roots(&config);
         let mut sweep = 0_u32;
         let mut deadlines = BTreeMap::new();
@@ -711,6 +713,25 @@ impl Worker {
                     update_cost = update_started.elapsed().min(Duration::from_secs(3));
                 }
                 if let Some(next) = next {
+                    // What changed on disk goes to the history; an update
+                    // caused by other settings (roots, exclusions) does not.
+                    if next.config == current.config
+                        && next.roots == current.roots
+                        && !current.entries.is_empty()
+                    {
+                        let targets: Option<Vec<PathBuf>> =
+                            (!full && !quick).then(|| changed.iter().cloned().collect());
+                        let changes = crate::journal::diff(
+                            &current.entries,
+                            &next.entries,
+                            targets.as_deref(),
+                            index::now() as i64,
+                        );
+                        if let Err(e) = journal.append(&changes) {
+                            state.write().unwrap().status.message =
+                                format!("Cannot record changes: {e}");
+                        }
+                    }
                     let persisted = if full || quick {
                         {
                             let mut s = state.write().unwrap();

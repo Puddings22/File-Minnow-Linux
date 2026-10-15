@@ -330,6 +330,8 @@ pub(crate) struct App {
     undo_item: gtk::MenuItem,
     /// Searches before each folder browsed into, for Alt+Left.
     browse_back: Vec<String>,
+    /// Tools > Recent Changes, while it is open.
+    changes: Option<Rc<crate::changes_ui::ChangesWindow>>,
 }
 impl Drop for App {
     fn drop(&mut self) {
@@ -736,6 +738,7 @@ pub fn run_with_options(roots: Vec<PathBuf>, dir: PathBuf, launch: LaunchOptions
         undo: Vec::new(),
         undo_item: gtk::MenuItem::with_mnemonic("_Undo"),
         browse_back: Vec::new(),
+        changes: None,
     }));
     let weak = Rc::downgrade(&app);
     build_columns(&app);
@@ -1385,6 +1388,12 @@ fn build_menus(app: &AppRef, bar: &gtk::MenuBar) {
                 });
             }
             "_Tools" => {
+                let t = w.clone();
+                item(&menu, "Recent _Changes…", move || {
+                    if let Some(a) = t.upgrade() {
+                        App::recent_changes(&a);
+                    }
+                });
                 let t = w.clone();
                 item(&menu, "_Options…", move || {
                     if let Some(a) = t.upgrade() {
@@ -2367,6 +2376,11 @@ impl App {
         if status.generation != self.last_generation
             || settings.ui.hide_results_until_search != self.hide_until_search
         {
+            if status.generation != self.last_generation
+                && let Some(changes) = &self.changes
+            {
+                changes.reload();
+            }
             self.last_generation = status.generation;
             self.schedule();
         }
@@ -3119,6 +3133,24 @@ impl App {
         } else {
             trash_paths(paths, self.messages.clone());
         }
+    }
+    /// Shows Tools > Recent Changes (or brings it forward).
+    fn recent_changes(app: &AppRef) {
+        let mut a = app.borrow_mut();
+        if let Some(window) = &a.changes {
+            window.window.present();
+            return;
+        }
+        let tx = a.messages.clone();
+        let open: crate::changes_ui::Open = Rc::new(move |path, folder| {
+            open_paths(vec![path], folder, tx.clone());
+        });
+        let window = crate::changes_ui::ChangesWindow::new(&a.window, &a.data_dir, open);
+        let weak = Rc::downgrade(app);
+        window
+            .window
+            .connect_destroy(move |_| with_app(&weak, |a| a.changes = None));
+        a.changes = Some(window);
     }
     /// Takes back the last rename or move to the Trash.
     fn undo(&mut self) {

@@ -587,7 +587,24 @@ try:
         wait_window(lambda s: s['query'] == 'ext:')
         xdo('key', 'ctrl+l', 'BackSpace')
         wait_window(lambda s: s['query'] == '')
-        menu_checks = {'search_completion': True, 'browse_folders_inside': True, **undo_checks, 'drag_out_selection': True, 'bookmarks_menu': True, 'custom_filter': True, 'export_csv': True, 'view_menu_remembered': True, 'show_in_folder_scope': True, 'search_here_cursor_after_folder': True, 'empty_until_search': True, 'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
+        # Tools > Recent Changes lists what this test changed on disk.
+        xdo('windowfocus', '--sync', window)
+        xdo('key', 'alt+t')
+        time.sleep(.4)
+        xdo('key', 'c')
+        changes_window = xdo('search', '--sync', '--onlyvisible', '--name', '^Recent Changes$').splitlines()[0]
+        time.sleep(.5)
+        subprocess.run(['import', '-quiet', '-window', changes_window, str(output / 'recent-changes.png')], env=env, check=True)
+        recorded = subprocess.check_output([binary, '--data-dir', str(cache), 'changes', '--json'], env=env, text=True)
+        actions = [(c['a'], Path(c['p']).name) for c in json.loads(recorded)]
+        assert ('moved', 'lib.rs') in actions and ('created', 'lib.rs') in actions, actions
+        xdo('windowfocus', '--sync', changes_window)
+        xdo('key', 'Escape')
+        deadline = time.monotonic() + 5
+        while subprocess.run(['xdotool', 'search', '--onlyvisible', '--name', '^Recent Changes$'], env=env, capture_output=True).returncode == 0:
+            assert time.monotonic() < deadline, 'Recent Changes did not close'
+            time.sleep(.05)
+        menu_checks = {'recent_changes': True, 'search_completion': True, 'browse_folders_inside': True, **undo_checks, 'drag_out_selection': True, 'bookmarks_menu': True, 'custom_filter': True, 'export_csv': True, 'view_menu_remembered': True, 'show_in_folder_scope': True, 'search_here_cursor_after_folder': True, 'empty_until_search': True, 'start_at_login_toggle': True, 'type_filter_document': True, 'open_with_default_app': True, 'launched_app_output_detached': True, 'nemo_action_ran': True, 'properties_via_file_manager': True, 'show_items_via_file_manager': True, 'clipboard_files': True, 'rename_f2': True, 'trash_delete': True}
         # Right-click > Exclude from Index drops the entry and lists the path
         # in the exclusions.
         xdo('windowfocus', '--sync', window)

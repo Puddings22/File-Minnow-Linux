@@ -370,3 +370,55 @@ fn exclusions_and_exceptions_added_while_running() {
     assert!(has(&s.snapshot, b"wanted.txt") && !has(&s.snapshot, b"stray.txt"));
     assert!(!has(&s.snapshot, b"keep") && !has(&s.snapshot, b"letter.txt"));
 }
+
+#[test]
+fn live_changes_are_recorded_in_the_history() {
+    use file_minnow::journal::{Action, Journal};
+    let (_temp, root, dir, config, settings) = setup();
+    let runtime = Runtime::configured(settings, dir.clone(), config).unwrap();
+    wait(&runtime, |s, _| s.generation > 0);
+    let journal = Journal::new(&dir);
+    let history = || -> Vec<(Action, String, Option<String>)> {
+        journal
+            .read(0)
+            .into_iter()
+            .rev()
+            .map(|c| {
+                let name =
+                    |p: &RawPath| p.path().file_name().unwrap().to_string_lossy().into_owned();
+                (c.action, name(&c.path), c.to.as_ref().map(name))
+            })
+            .collect()
+    };
+    fs::write(root.join("draft.txt"), b"x").unwrap();
+    wait(&runtime, |s, _| has(s, b"draft.txt"));
+    fs::rename(root.join("draft.txt"), root.join("final.txt")).unwrap();
+    wait(&runtime, |s, _| has(s, b"final.txt"));
+    fs::write(root.join("final.txt"), b"longer now").unwrap();
+    wait(&runtime, |s, _| {
+        s.entries
+            .iter()
+            .any(|e| e.name() == b"final.txt" && e.size == 10)
+    });
+    fs::remove_file(root.join("final.txt")).unwrap();
+    wait(&runtime, |s, _| !has(s, b"final.txt"));
+    assert_eq!(
+        history(),
+        [
+            (Action::Created, "draft.txt".to_owned(), None),
+            (
+                Action::Moved,
+                "draft.txt".to_owned(),
+                Some("final.txt".to_owned())
+            ),
+            (Action::Modified, "final.txt".to_owned(), None),
+            (Action::Deleted, "final.txt".to_owned(), None),
+        ]
+    );
+    // Changing the settings is not a change on disk.
+    let mut next = runtime.handle.settings();
+    next.index.excluded_folders = vec![RawPath::new(&root.join("nested"))];
+    runtime.handle.apply_settings(next).unwrap();
+    wait(&runtime, |s, _| !has(s, b"nested"));
+    assert_eq!(history().len(), 4);
+}

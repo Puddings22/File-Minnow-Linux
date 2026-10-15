@@ -1,5 +1,7 @@
 #[cfg(feature = "gui")]
 pub mod actions;
+#[cfg(feature = "gui")]
+pub mod changes_ui;
 pub mod client;
 pub mod config;
 #[cfg(feature = "gui")]
@@ -10,6 +12,7 @@ pub mod fold;
 pub mod history;
 pub mod index;
 pub mod integrations;
+pub mod journal;
 pub mod mounts;
 pub mod query;
 pub mod rename;
