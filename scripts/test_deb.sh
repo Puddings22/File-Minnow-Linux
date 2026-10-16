@@ -20,9 +20,6 @@ test -f /usr/share/applications/org.fileminnow.FileMinnow.desktop
 test -f /usr/share/icons/hicolor/scalable/apps/file-minnow.svg
 test -f /usr/share/nemo/actions/file-minnow-search-here.nemo_action
 test -f /usr/share/kio/servicemenus/file-minnow-search-here.desktop
-test -f /usr/share/gnome-shell/search-providers/org.fileminnow.FileMinnow.search-provider.ini
-test -f /usr/share/krunner/dbusplugins/file-minnow.desktop
-grep -q '^Exec=/usr/bin/file-minnow search-provider$' /usr/share/dbus-1/services/org.fileminnow.FileMinnow.SearchProvider.service
 test -f /usr/share/doc/file-minnow/licenses/dependencies.json
 test ! -e /etc/systemd/user/default.target.wants/file-minnow.service
 test ! -e /root/.config/autostart/file-minnow.desktop
@@ -33,6 +30,10 @@ test "$(file-minnow --data-dir /tmp/minnow-cache search ext:pdf)" = /tmp/minnow-
 settings_before=$(sha256sum /tmp/minnow-cache/settings.json)
 dpkg -i "$upgrade_package"
 test "$(sha256sum /tmp/minnow-cache/settings.json)" = "$settings_before"
+# Desktop search: GNOME Shell provider, KRunner plugin, D-Bus activation.
+test -f /usr/share/gnome-shell/search-providers/org.fileminnow.FileMinnow.search-provider.ini
+test -f /usr/share/krunner/dbusplugins/file-minnow.desktop
+grep -q '^Exec=/usr/bin/file-minnow search-provider$' /usr/share/dbus-1/services/org.fileminnow.FileMinnow.SearchProvider.service
 test "$(file-minnow --data-dir /tmp/minnow-cache search ext:pdf)" = /tmp/minnow-files/invoice.pdf
 
 # The GUI's native libraries must be covered by the application package. These
