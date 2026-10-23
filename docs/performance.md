@@ -103,3 +103,36 @@ python3 scripts/benchmark_io.py
 # Full desktop app on a private virtual X server (needs Xvfb)
 python3 scripts/measure_gui.py --help
 ```
+
+## Compact index (0.10)
+
+Measured on a 16-core machine with 62 GB RAM, an ext4 home folder on NVMe and Linux
+6.12. The folder had 5.69 million files and 0.91 million directories (6.26 million
+indexed entries, 828 MB of path text). These are one machine's numbers, not guarantees.
+
+| | 0.9 in-memory index | 0.10 compact + mapped |
+|---|---:|---:|
+| Index memory | 465 MB | 300 MB |
+| Index file | 461 MB | 299 MB |
+| Build peak RSS | 486 MB | 308 MB |
+| Load saved index | 224 ms | 61 ms |
+| Daemon idle RSS | about 700 MB | 188 MB |
+| Folder monitoring | 908,000 inotify watches | 1 fanotify mark (root mode) |
+| `a` (3.9M matches, name sort) | 93 ms | 178 ms |
+| `readme` (42,700 matches) | 46 ms | 83 ms |
+| `path:src main` | 212 ms | 522 ms |
+| `regex:^test.*\.py$` | 96 ms | 210 ms |
+| `a` sorted by type | 264 ms | 526 ms |
+
+The compact index stores directory names as parent-linked nodes and packs each row into
+24 bytes. Rows no longer store a name length: names are back to back, so a name ends
+where the next one begins. The saved file is mapped; after a save the daemon reloads it
+and returns mapped pages to the page cache when idle, which is why idle RSS is much
+lower than the index size. The trade-off is that path and regex queries rebuild directory
+paths or touch the next row, so they are about twice as slow as the old in-memory table.
+Narrow name queries are unchanged within noise.
+
+The start-up quick scan still builds a heap copy while it reconciles changed folders; on
+this home folder that peak was about 1.1 GB. When no folder changed, the mapped index is
+kept and the peak is much lower.
+

@@ -222,6 +222,21 @@ when it is closed. The daily safety rescan catches anything a watch could miss, 
 changes on network mounts or folders beyond the system's watch limit
 (`fs.inotify.max_user_watches`). Watch problems are shown in the status bar.
 
+### Fanotify
+
+On a very large tree, `--watch fanotify` replaces one inotify watch per folder with one
+fanotify mark per filesystem:
+
+```bash
+sudo file-minnow daemon --watch fanotify --root "$HOME"
+```
+
+The daemon needs root to add the mark. It then chowns its data directory to `SUDO_UID`
+and drops to that user; the GTK window stays unprivileged and talks to the daemon.
+Adding a mark to a filesystem needs Linux 5.9 or newer. Filesystems mounted after the
+daemon starts are not marked; restart it after plugging in a drive. `--watch auto` uses
+fanotify only when the daemon starts as root and otherwise uses inotify.
+
 Adding a folder, an exclusion or an always-indexed folder updates just those paths; the
 rest of the index is kept as it is. Pausing indexing keeps searches working against the
 current index; resuming catches up.

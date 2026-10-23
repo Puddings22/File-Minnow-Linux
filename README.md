@@ -17,9 +17,12 @@ File Minnow is built for exactly that.
 - **Instant results.** Searches over a 1.6-million-file index typically take
   10–50 ms. Results update on every keystroke.
 - **Real-time index.** New, renamed and deleted files appear in the open results within
-  a fraction of a second (Linux inotify). There is no hourly `updatedb` and no stale results.
+  a fraction of a second (Linux inotify, or one fanotify mark per filesystem when the
+  daemon runs as root). There is no hourly `updatedb` and no stale results.
   At start-up only the folders that changed since the last run are read again.
-- **Light on resources.** About 100 MB of memory for a 1.6-million-file index. It uses
+- **Light on resources.** About 75 MB of memory for a 1.6-million-entry index. On a
+  6.26-million-entry home folder the compact index is about 300 MB and a daemon that has
+  been idle drops back to about 190 MB by returning mapped pages to the page cache. It uses
   **0 % CPU when idle**, has no animations, and never polls in the background.
 - **Familiar search syntax.** `AND`, `|` (OR), `!` (NOT), wildcards, `ext:`, `size:`,
   `dm:` / `dc:` (date modified / created, with `thisweek`, `lastmonth`, `last7days`…),
@@ -125,6 +128,21 @@ packaging, desktop integration, autostart and the optional background service.
 3. Press the global shortcut (**Ctrl+Alt+Space** by default; change it in
    **Options → Keyboard**) from anywhere, type, and press Enter.
 
+### Fanotify (optional, root)
+
+On very large trees, one fanotify mark per filesystem replaces one inotify watch per
+folder. Start the daemon as root and point it at your folders:
+
+```bash
+sudo file-minnow daemon --watch fanotify --root "$HOME"
+```
+
+The daemon adds the mark while it is root, chowns its data directory to the invoking
+user, and drops to that user. `--watch auto` (the default) uses fanotify only when the
+daemon starts as root; otherwise it uses inotify. Filesystems mounted after startup are
+not marked, so restart the daemon after plugging in a drive. This mode is only for the
+daemon; do not run the GTK window as root.
+
 ### Search syntax
 
 | Search | Finds |
@@ -203,9 +221,10 @@ needs a StatusNotifierItem host. Window show and hide on Wayland is still being
 improved.
 
 **How much memory does it use?**
-Roughly 60–70 bytes per indexed entry plus the GTK window. For 1.6 million files that
-is about 100 MB of index and about 170 MB for the whole app.
-See [docs/performance.md](docs/performance.md).
+Roughly 48 bytes per indexed entry plus the GTK window. For 1.6 million entries that is
+about 75 MB of index and about 150 MB for the whole app. A 6.26-million-entry home folder
+measured about 300 MB of index and 190 MB of daemon RSS after the mapped pages were
+released. See [docs/performance.md](docs/performance.md).
 
 ## Status
 
