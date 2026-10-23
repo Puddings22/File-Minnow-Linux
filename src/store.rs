@@ -116,6 +116,8 @@ pub fn quarantine(dir: &Path) -> Result<()> {
 /// not deliberate tampering (the file is private to the user).
 struct Checksum(u64);
 impl Checksum {
+    // `as_chunks` needs a newer MSRV than the rest of the crate.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     fn update(&mut self, bytes: &[u8]) {
         let mut chunks = bytes.chunks_exact(8);
         for chunk in &mut chunks {
