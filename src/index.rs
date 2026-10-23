@@ -1,5 +1,6 @@
 pub use crate::table::{Builder, Table, path_cmp};
 use anyhow::{Result, bail};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -130,6 +131,72 @@ fn kind_of(m: &fs::Metadata) -> Kind {
     } else {
         Kind::Other
     }
+}
+fn kind_of_type(ft: fs::FileType) -> Kind {
+    if ft.is_dir() {
+        Kind::Folder
+    } else if ft.is_symlink() {
+        Kind::Link
+    } else if ft.is_file() {
+        Kind::File
+    } else {
+        Kind::Other
+    }
+}
+
+/// The metadata the index keeps for each entry. One `statx` call returns all
+/// three fields on Linux; the fallback reads metadata and creation time
+/// separately for filesystems without `statx`/btime support.
+#[derive(Clone, Copy, Debug)]
+struct Stat {
+    size: u64,
+    modified: i64,
+    created: i64,
+}
+fn stat_path(path: &Path) -> std::io::Result<Stat> {
+    #[cfg(target_os = "linux")]
+    {
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes());
+        if let Ok(name) = name {
+            let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+            // SAFETY: `name` is a valid NUL-terminated path and `stx` is a
+            // valid, writable statx buffer.
+            let result = unsafe {
+                libc::statx(
+                    libc::AT_FDCWD,
+                    name.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT,
+                    libc::STATX_BASIC_STATS | libc::STATX_BTIME,
+                    &mut stx,
+                )
+            };
+            if result == 0 {
+                let created = if stx.stx_mask & libc::STATX_BTIME != 0 {
+                    stx.stx_btime.tv_sec
+                } else {
+                    crate::table::NO_DATE
+                };
+                return Ok(Stat {
+                    size: stx.stx_size,
+                    modified: stx.stx_mtime.tv_sec,
+                    created,
+                });
+            }
+            let error = std::io::Error::last_os_error();
+            if !matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSYS) | Some(libc::EINVAL)
+            ) {
+                return Err(error);
+            }
+        }
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    Ok(Stat {
+        size: metadata.len(),
+        modified: metadata.mtime(),
+        created: created_of(&metadata),
+    })
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -349,6 +416,48 @@ pub struct ScanLog<'a> {
     pub visited: &'a mut usize,
 }
 
+/// One entry waiting for its metadata. The walker keeps these in path order;
+/// `stat_batch` preserves that order across the parallel metadata calls.
+struct PendingEntry {
+    path: PathBuf,
+    kind: Kind,
+}
+const STAT_BATCH: usize = 4096;
+
+fn stat_batch(batch: &mut Vec<PendingEntry>, builder: &mut Builder, log: &mut ScanLog) {
+    if batch.is_empty() {
+        return;
+    }
+    let stats: Vec<std::io::Result<Stat>> = batch
+        .par_iter()
+        .map(|entry| stat_path(&entry.path))
+        .collect();
+    for (entry, stat) in std::mem::take(batch).into_iter().zip(stats) {
+        match stat {
+            Ok(stat) => {
+                if !builder.push_with(
+                    entry.path.as_os_str().as_bytes(),
+                    entry.kind,
+                    stat.size,
+                    stat.modified,
+                    stat.created,
+                ) {
+                    record_error(
+                        log.errors,
+                        log.count,
+                        format!("{}: name too long to index", entry.path.display()),
+                    );
+                }
+            }
+            Err(err) => record_error(
+                log.errors,
+                log.count,
+                format!("{}: {err}", entry.path.display()),
+            ),
+        }
+    }
+}
+
 /// Walks roots (or targets inside them) and appends rows in component path
 /// order, so no sorted copy of all paths is ever built. Returns false when
 /// cancelled; the builder then holds a partial walk and must be discarded.
@@ -421,6 +530,7 @@ pub fn scan_into(
             } else {
                 1 - depth
             };
+            let mut batch = Vec::with_capacity(STAT_BATCH);
             for item in WalkDir::new(&path)
                 .follow_links(false)
                 .max_depth(max_depth)
@@ -442,45 +552,31 @@ pub fn scan_into(
                         continue;
                     }
                 };
-                match item.metadata() {
-                    Ok(m) => {
-                        let kind = kind_of(&m);
-                        // Non-recursive roots watch only the root folder itself.
-                        if kind == Kind::Folder
-                            && root_config.monitor
-                            && (root_config.recursive || depth + item.depth() == 0)
-                            && let Some(watch) = watch
-                        {
-                            watch(item.path());
-                        }
-                        let indexed = if kind == Kind::Folder {
-                            rules.index_folder(item.path(), &root)
-                        } else {
-                            rules.include_file(item.path(), &root)
-                        };
-                        if indexed
-                            && !builder.push_with(
-                                item.path().as_os_str().as_bytes(),
-                                kind,
-                                m.len(),
-                                m.mtime(),
-                                created_of(&m),
-                            )
-                        {
-                            record_error(
-                                log.errors,
-                                log.count,
-                                format!("{}: name too long to index", item.path().display()),
-                            );
-                        }
+                let kind = kind_of_type(item.file_type());
+                // Non-recursive roots watch only the root folder itself.
+                if kind == Kind::Folder
+                    && root_config.monitor
+                    && (root_config.recursive || depth + item.depth() == 0)
+                    && let Some(watch) = watch
+                {
+                    watch(item.path());
+                }
+                let indexed = if kind == Kind::Folder {
+                    rules.index_folder(item.path(), &root)
+                } else {
+                    rules.include_file(item.path(), &root)
+                };
+                if indexed {
+                    batch.push(PendingEntry {
+                        path: item.path().to_path_buf(),
+                        kind,
+                    });
+                    if batch.len() >= STAT_BATCH {
+                        stat_batch(&mut batch, builder, log);
                     }
-                    Err(err) => record_error(
-                        log.errors,
-                        log.count,
-                        format!("{}: {err}", item.path().display()),
-                    ),
                 }
             }
+            stat_batch(&mut batch, builder, log);
         }
     }
     progress(*log.visited);
@@ -883,5 +979,36 @@ impl Quick<'_, '_> {
             }
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_scan_keeps_path_order_and_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        // More than one stat batch, so the ordered parallel path is exercised.
+        for i in 0..(STAT_BATCH + 32) {
+            fs::write(root.join(format!("f{i:05}.txt")), b"x").unwrap();
+        }
+        fs::write(root.join("sub/z.txt"), b"hello").unwrap();
+
+        let snapshot = scan(&[root], &temp.path().join("cache"), 1);
+        let entries = snapshot.entries.entries();
+        assert!(
+            entries
+                .windows(2)
+                .all(|pair| path_cmp(&pair[0].path, &pair[1].path) != std::cmp::Ordering::Greater)
+        );
+        let z = entries
+            .iter()
+            .find(|entry| entry.path.ends_with(b"/sub/z.txt"))
+            .expect("nested file");
+        assert_eq!(z.size, 5);
+        assert!(z.modified > 0);
     }
 }
