@@ -51,6 +51,9 @@ enum Command {
         root: Vec<PathBuf>,
         #[arg(long,value_parser=clap::value_parser!(u64).range(1..))]
         rescan_seconds: Option<u64>,
+        /// Folder-change backend (auto uses fanotify when started as root)
+        #[arg(long, value_enum)]
+        watch: Option<config::WatchMode>,
     },
     /// Show saved-index or daemon status
     Status {
@@ -232,12 +235,16 @@ fn main() -> Result<()> {
         Command::Daemon {
             root,
             rescan_seconds,
+            watch,
         } => {
             let (preferences, mut settings) = config::open_for_roots(&root, &dir)?;
             if let Some(seconds) = rescan_seconds {
                 for root in &mut settings.index.roots {
                     root.schedule = config::Schedule::Interval { seconds };
                 }
+            }
+            if let Some(watch) = watch {
+                settings.index.watch = watch;
             }
             let runtime = Runtime::configured(settings, dir.clone(), preferences)?;
             service::serve(&runtime, &dir)?;

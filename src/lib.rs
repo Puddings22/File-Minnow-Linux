@@ -7,6 +7,7 @@ pub mod config;
 #[cfg(feature = "gui")]
 pub mod desktop;
 pub mod efu;
+pub mod fanotify;
 #[cfg(feature = "gui")]
 pub mod file_ops;
 pub mod fold;

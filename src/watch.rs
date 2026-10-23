@@ -10,6 +10,7 @@
 //! Each watch costs the kernel a small amount of memory (on the order of
 //! 1 KB), bounded by `fs.inotify.max_user_watches`. When the limit is hit the
 //! failure is reported and periodic rescans cover the rest.
+use crate::{config::WatchMode, fanotify::FanotifyWatcher};
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask, Watches};
 use std::{
     collections::HashMap,
@@ -76,14 +77,14 @@ impl Map {
     }
 }
 
-pub struct Watcher {
+pub struct InotifyWatcher {
     watches: Watches,
     map: Arc<Mutex<Map>>,
     wake: i32,
     thread: Option<thread::JoinHandle<()>>,
 }
 
-impl Watcher {
+impl InotifyWatcher {
     pub fn new(on_signal: impl Fn(Signal) + Send + 'static) -> io::Result<Self> {
         let mut inotify = Inotify::init()?;
         let watches = inotify.watches();
@@ -261,6 +262,14 @@ impl Watcher {
         self.map.lock().unwrap().entries.len()
     }
 
+    pub fn record_error(&self, message: String) {
+        let mut map = self.map.lock().unwrap();
+        if map.errors.len() < 5 {
+            map.errors.push(message);
+        }
+        map.failed += 1;
+    }
+
     /// Watch failures since the last sweep began, with a total count.
     pub fn errors(&self) -> (Vec<String>, usize) {
         let map = self.map.lock().unwrap();
@@ -268,7 +277,7 @@ impl Watcher {
     }
 }
 
-impl Drop for Watcher {
+impl Drop for InotifyWatcher {
     fn drop(&mut self) {
         // SAFETY: writing one byte to, then closing, our own pipe end.
         unsafe {
@@ -277,6 +286,102 @@ impl Drop for Watcher {
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+    }
+}
+
+enum Backend {
+    Inotify(InotifyWatcher),
+    Fanotify(FanotifyWatcher),
+}
+
+/// Folder monitoring, either one inotify watch per folder or one fanotify
+/// mark per filesystem when the daemon starts as root.
+pub struct Watcher {
+    backend: Backend,
+    fallback: Option<String>,
+}
+impl Watcher {
+    /// The unprivileged inotify watcher. Used by tests and small tools.
+    pub fn new(on_signal: impl Fn(Signal) + Send + 'static) -> io::Result<Self> {
+        Ok(Self {
+            backend: Backend::Inotify(InotifyWatcher::new(on_signal)?),
+            fallback: None,
+        })
+    }
+    pub fn new_with_mode(
+        on_signal: impl Fn(Signal) + Send + Sync + 'static,
+        mode: WatchMode,
+        roots: &[PathBuf],
+    ) -> io::Result<Self> {
+        let callback: Arc<dyn Fn(Signal) + Send + Sync> = Arc::new(on_signal);
+        let mut fallback = None;
+        let try_fanotify = match mode {
+            WatchMode::Fanotify => true,
+            // SAFETY: geteuid has no preconditions.
+            WatchMode::Auto => unsafe { libc::geteuid() == 0 },
+            WatchMode::Inotify => false,
+        };
+        if try_fanotify {
+            match FanotifyWatcher::new(callback.clone(), roots) {
+                Ok(watcher) => {
+                    return Ok(Self {
+                        backend: Backend::Fanotify(watcher),
+                        fallback: None,
+                    });
+                }
+                Err(error) => fallback = Some(format!("fanotify unavailable: {error}")),
+            }
+        }
+        let callback = callback;
+        Ok(Self {
+            backend: Backend::Inotify(InotifyWatcher::new(move |signal| callback(signal))?),
+            fallback,
+        })
+    }
+    pub fn begin_sweep(&self) -> u32 {
+        match &self.backend {
+            Backend::Inotify(watcher) => watcher.begin_sweep(),
+            Backend::Fanotify(watcher) => watcher.begin_sweep(),
+        }
+    }
+    pub fn add(&self, folder: &Path, sweep: u32) {
+        match &self.backend {
+            Backend::Inotify(watcher) => watcher.add(folder, sweep),
+            Backend::Fanotify(watcher) => watcher.add(folder, sweep),
+        }
+    }
+    pub fn finish_sweep(&self, sweep: u32) {
+        match &self.backend {
+            Backend::Inotify(watcher) => watcher.finish_sweep(sweep),
+            Backend::Fanotify(watcher) => watcher.finish_sweep(sweep),
+        }
+    }
+    pub fn count(&self) -> usize {
+        match &self.backend {
+            Backend::Inotify(watcher) => watcher.count(),
+            Backend::Fanotify(watcher) => watcher.count(),
+        }
+    }
+    pub fn errors(&self) -> (Vec<String>, usize) {
+        let (mut errors, failed) = match &self.backend {
+            Backend::Inotify(watcher) => watcher.errors(),
+            Backend::Fanotify(watcher) => watcher.errors(),
+        };
+        if let Some(fallback) = &self.fallback {
+            errors.insert(0, fallback.clone());
+            (errors, failed + 1)
+        } else {
+            (errors, failed)
+        }
+    }
+    pub fn is_fanotify(&self) -> bool {
+        matches!(self.backend, Backend::Fanotify(_))
+    }
+    pub fn record_error(&self, message: String) {
+        match &self.backend {
+            Backend::Inotify(watcher) => watcher.record_error(message),
+            Backend::Fanotify(watcher) => watcher.record_error(message),
         }
     }
 }
@@ -303,7 +408,7 @@ mod tests {
         let root = temp.path().join("root");
         fs::create_dir_all(root.join("sub")).unwrap();
         let (tx, rx) = mpsc::channel();
-        let watcher = Watcher::new(move |s| {
+        let watcher = InotifyWatcher::new(move |s| {
             let _ = tx.send(s);
         })
         .unwrap();

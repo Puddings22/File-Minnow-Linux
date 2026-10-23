@@ -491,26 +491,36 @@ impl Worker {
         let tx = self.tx.clone();
         let event_policy = Arc::new(RwLock::new(EventPolicy::new(&config)?));
         let policy = event_policy.clone();
-        let watcher = Watcher::new(move |signal| {
-            match signal {
-                Signal::Overflow => over.store(true, Ordering::Relaxed),
-                Signal::Changed(paths) => {
-                    let policy = policy.read().unwrap();
-                    let paths: Vec<_> = paths
-                        .into_iter()
-                        .filter(|p| policy.accepts(p, &data))
-                        .collect();
-                    if paths.is_empty() {
-                        return;
-                    }
-                    if tx.try_send(Command::Event(paths)).is_err() {
-                        over.store(true, Ordering::Relaxed);
+        let watcher = Watcher::new_with_mode(
+            move |signal| {
+                match signal {
+                    Signal::Overflow => over.store(true, Ordering::Relaxed),
+                    Signal::Changed(paths) => {
+                        let policy = policy.read().unwrap();
+                        let paths: Vec<_> = paths
+                            .into_iter()
+                            .filter(|p| policy.accepts(p, &data))
+                            .collect();
+                        if paths.is_empty() {
+                            return;
+                        }
+                        if tx.try_send(Command::Event(paths)).is_err() {
+                            over.store(true, Ordering::Relaxed);
+                        }
                     }
                 }
-            }
-            wake.unpark();
-        })
+                wake.unpark();
+            },
+            config.watch,
+            &config.paths(),
+        )
         .ok();
+        if let Some(watcher) = &watcher
+            && watcher.is_fanotify()
+            && let Err(error) = crate::fanotify::drop_to_invoker(dir)
+        {
+            watcher.record_error(format!("cannot drop privileges: {error}"));
+        }
         if watcher.is_none() && config_monitors(&config) {
             state.write().unwrap().status.watch_errors = vec![
                 "Native monitoring unavailable; periodic fallback scans are active".to_owned(),

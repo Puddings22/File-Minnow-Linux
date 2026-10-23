@@ -179,6 +179,16 @@ impl RootConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum WatchMode {
+    /// Fanotify when running as root, inotify otherwise.
+    #[default]
+    Auto,
+    Inotify,
+    Fanotify,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IndexConfig {
@@ -202,6 +212,8 @@ pub struct IndexConfig {
     pub removable_drives: bool,
     pub event_debounce_ms: u64,
     pub fallback_rescan_seconds: u64,
+    /// Folder-change backend. Fanotify needs root; auto uses it only then.
+    pub watch: WatchMode,
 }
 impl Default for IndexConfig {
     fn default() -> Self {
@@ -221,6 +233,7 @@ impl Default for IndexConfig {
             removable_drives: false,
             event_debounce_ms: 200,
             fallback_rescan_seconds: 1800,
+            watch: WatchMode::Auto,
         }
     }
 }
@@ -271,6 +284,7 @@ impl IndexConfig {
         }
         rules.event_debounce_ms = 0;
         rules.fallback_rescan_seconds = 0;
+        rules.watch = WatchMode::Auto;
         serde_json::to_vec(&rules)
             .unwrap_or_default()
             .iter()
