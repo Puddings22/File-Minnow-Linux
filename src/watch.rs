@@ -12,7 +12,7 @@
 //! failure is reported and periodic rescans cover the rest.
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask, Watches};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     io,
     os::fd::AsRawFd,
     path::{Path, PathBuf},
@@ -40,27 +40,37 @@ const MASK: WatchMask = WatchMask::CREATE
     .union(WatchMask::DONT_FOLLOW)
     .union(WatchMask::EXCL_UNLINK);
 
+struct WatchEntry {
+    path: Box<Path>,
+    wd: WatchDescriptor,
+    sweep: u32,
+}
+
 #[derive(Default)]
 struct Map {
-    by_wd: HashMap<WatchDescriptor, Arc<Path>>,
-    /// Ordered by path so a folder's whole subtree is one range.
-    by_path: BTreeMap<Arc<Path>, (WatchDescriptor, u32)>,
+    /// In the order the scanner reaches folders, which is path order.
+    entries: Vec<WatchEntry>,
+    by_wd: HashMap<WatchDescriptor, u32>,
     sweep: u32,
     errors: Vec<String>,
     failed: usize,
 }
 impl Map {
+    fn remove(&mut self, watches: &mut Watches, index: usize) {
+        let entry = self.entries.swap_remove(index);
+        self.by_wd.remove(&entry.wd);
+        let _ = watches.remove(entry.wd);
+        if let Some(moved) = self.entries.get(index) {
+            self.by_wd.insert(moved.wd.clone(), index as u32);
+        }
+    }
     fn forget(&mut self, watches: &mut Watches, root: &Path) {
-        let doomed: Vec<Arc<Path>> = self
-            .by_path
-            .range::<Path, _>((std::ops::Bound::Included(root), std::ops::Bound::Unbounded))
-            .take_while(|(path, _)| path.starts_with(root))
-            .map(|(path, _)| path.clone())
-            .collect();
-        for path in doomed {
-            if let Some((wd, _)) = self.by_path.remove(&path) {
-                self.by_wd.remove(&wd);
-                let _ = watches.remove(wd);
+        let mut index = 0;
+        while index < self.entries.len() {
+            if self.entries[index].path.starts_with(root) {
+                self.remove(watches, index);
+            } else {
+                index += 1;
             }
         }
     }
@@ -133,16 +143,16 @@ impl Watcher {
                                     overflow = true;
                                     continue;
                                 }
-                                let Some(dir) = map.by_wd.get(&event.wd).cloned() else {
+                                let Some(&index) = map.by_wd.get(&event.wd) else {
                                     continue;
                                 };
+                                let Some(entry) = map.entries.get(index as usize) else {
+                                    continue;
+                                };
+                                let dir = entry.path.clone();
                                 if event.mask.contains(EventMask::IGNORED) {
                                     // The kernel removed the watch (folder deleted or unmounted).
-                                    map.by_wd.remove(&event.wd);
-                                    if map.by_path.get(&dir).is_some_and(|(wd, _)| *wd == event.wd)
-                                    {
-                                        map.by_path.remove(&dir);
-                                    }
+                                    map.remove(&mut event_watches, index as usize);
                                     continue;
                                 }
                                 let path = match event.name {
@@ -160,7 +170,7 @@ impl Watcher {
                                     map.forget(&mut event_watches, &path);
                                 }
                                 if event.mask.contains(EventMask::MOVE_SELF) {
-                                    map.forget(&mut event_watches, &dir);
+                                    map.forget(&mut event_watches, dir.as_ref());
                                 }
                                 changed.push(path);
                             }
@@ -202,18 +212,22 @@ impl Watcher {
         let mut map = self.map.lock().unwrap();
         match result {
             Ok(wd) => {
-                let path: Arc<Path> = match map.by_wd.get(&wd) {
+                if let Some(&index) = map.by_wd.get(&wd) {
                     // Same folder already watched (perhaps under an older path).
-                    Some(old) if **old == *folder => old.clone(),
-                    Some(old) => {
-                        let old = old.clone();
-                        map.by_path.remove(&old);
-                        folder.into()
+                    let entry = &mut map.entries[index as usize];
+                    if entry.path.as_ref() != folder {
+                        entry.path = folder.into();
                     }
-                    None => folder.into(),
-                };
-                map.by_wd.insert(wd.clone(), path.clone());
-                map.by_path.insert(path, (wd, sweep));
+                    entry.sweep = sweep;
+                } else {
+                    let index = map.entries.len() as u32;
+                    map.by_wd.insert(wd.clone(), index);
+                    map.entries.push(WatchEntry {
+                        path: folder.into(),
+                        wd,
+                        sweep,
+                    });
+                }
             }
             Err(e) => {
                 map.failed += 1;
@@ -232,23 +246,19 @@ impl Watcher {
     /// Drops watches that the sweep `sweep` did not reach.
     pub fn finish_sweep(&self, sweep: u32) {
         let mut map = self.map.lock().unwrap();
-        let stale: Vec<Arc<Path>> = map
-            .by_path
-            .iter()
-            .filter(|(_, (_, seen))| *seen != sweep)
-            .map(|(path, _)| path.clone())
-            .collect();
         let mut watches = self.watches.clone();
-        for path in stale {
-            if let Some((wd, _)) = map.by_path.remove(&path) {
-                map.by_wd.remove(&wd);
-                let _ = watches.remove(wd);
+        let mut index = 0;
+        while index < map.entries.len() {
+            if map.entries[index].sweep != sweep {
+                map.remove(&mut watches, index);
+            } else {
+                index += 1;
             }
         }
     }
 
     pub fn count(&self) -> usize {
-        self.map.lock().unwrap().by_path.len()
+        self.map.lock().unwrap().entries.len()
     }
 
     /// Watch failures since the last sweep began, with a total count.
@@ -319,5 +329,30 @@ mod tests {
         watcher.finish_sweep(sweep);
         assert_eq!(watcher.count(), 1);
         drop(watcher);
+    }
+
+    #[test]
+    fn forget_keeps_watch_indices_valid() {
+        let temp = tempfile::tempdir().unwrap();
+        let inotify = Inotify::init().unwrap();
+        let mut watches = inotify.watches();
+        let mut map = Map::default();
+        for relative in ["a/1", "a/2", "b/1", "b/2"] {
+            let dir = temp.path().join(relative);
+            fs::create_dir_all(&dir).unwrap();
+            let wd = watches.add(&dir, MASK).unwrap();
+            let index = map.entries.len() as u32;
+            map.by_wd.insert(wd.clone(), index);
+            map.entries.push(WatchEntry {
+                path: dir.into_boxed_path(),
+                wd,
+                sweep: 1,
+            });
+        }
+        map.forget(&mut watches, &temp.path().join("a"));
+        assert_eq!(map.entries.len(), 2);
+        for (index, entry) in map.entries.iter().enumerate() {
+            assert_eq!(map.by_wd.get(&entry.wd), Some(&(index as u32)));
+        }
     }
 }
