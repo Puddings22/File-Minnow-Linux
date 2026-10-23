@@ -221,6 +221,8 @@ fn tray_icons() -> Vec<ksni::Icon> {
             let bytes = icon.read_pixel_bytes();
             let mut data = Vec::with_capacity((width * height * 4) as usize);
             for row in bytes.chunks(stride).take(height as usize) {
+                // `as_chunks` needs a newer MSRV than the rest of the crate.
+                #[allow(clippy::chunks_exact_to_as_chunks)]
                 for rgba in row[..width as usize * 4].chunks_exact(4) {
                     data.extend_from_slice(&[rgba[3], rgba[0], rgba[1], rgba[2]]);
                 }
