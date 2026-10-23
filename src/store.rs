@@ -1,6 +1,6 @@
 use crate::{
     index::{Kind, Snapshot},
-    table::{Dirs, NO_DIR, Row, Table},
+    table::{DirNode, Dirs, NO_DIR, Row, Table},
 };
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
@@ -64,7 +64,10 @@ pub fn writer_lock(dir: &Path) -> Result<File> {
     Ok(file)
 }
 const INDEX: &str = "index.bin";
-const MAGIC: &[u8; 8] = b"FMNIDX04";
+const MAGIC: &[u8; 8] = b"FMNIDX05";
+/// Parent paths were stored as whole strings before 0.10; still read and
+/// converted to parent-linked nodes on load.
+const MAGIC_04: &[u8; 8] = b"FMNIDX04";
 /// The previous layout, without item counts: still read, and the counts
 /// computed on load.
 const MAGIC_03: &[u8; 8] = b"FMNIDX03";
@@ -210,9 +213,14 @@ pub fn save(dir: &Path, snapshot: &Snapshot) -> Result<()> {
         w.block(&serde_json::to_vec(&header)?)?;
         let (names, dirs, rows) = snapshot.entries.parts();
         w.u64(dirs.len() as u64)?;
-        for dir in dirs.iter() {
-            w.block(dir)?;
+        let mut node = [0_u8; 10];
+        for dir in dirs.nodes() {
+            node[0..4].copy_from_slice(&dir.parent.to_le_bytes());
+            node[4..8].copy_from_slice(&dir.name_off.to_le_bytes());
+            node[8..10].copy_from_slice(&dir.name_len.to_le_bytes());
+            w.bytes(&node)?;
         }
+        w.block(dirs.names())?;
         w.block(names)?;
         w.u64(rows.len() as u64)?;
         let mut record = [0_u8; ROW_BYTES];
@@ -261,14 +269,15 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
         // A previous version's cache: start empty, the next save replaces it.
         return Ok(Snapshot::default());
     }
-    if &magic != MAGIC && &magic != MAGIC_03 {
+    if &magic != MAGIC && &magic != MAGIC_04 && &magic != MAGIC_03 {
         bail!("Unknown index format; it will be rebuilt");
     }
-    let row_bytes = if &magic == MAGIC {
-        ROW_BYTES
-    } else {
+    let row_bytes = if &magic == MAGIC_03 {
         ROW_BYTES_03
+    } else {
+        ROW_BYTES
     };
+    let parent_linked = &magic == MAGIC;
     let mut r = Reader {
         input,
         sum: Checksum(0),
@@ -276,15 +285,50 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
     };
     let mut snapshot: Snapshot = serde_json::from_slice(&r.block()?)?;
     let dir_count = r.u64()?;
-    if dir_count.saturating_mul(8) > r.remaining || dir_count >= u64::from(NO_DIR) {
+    if dir_count >= u64::from(NO_DIR) {
         bail!("Index file is inconsistent");
     }
-    let mut dirs = Dirs::default();
-    for _ in 0..dir_count {
-        if !dirs.push(&r.block()?) {
+    let dirs = if parent_linked {
+        if dir_count.saturating_mul(10) > r.remaining {
             bail!("Index file is inconsistent");
         }
-    }
+        let mut nodes = Vec::with_capacity(dir_count as usize);
+        let mut record = [0_u8; 10];
+        for _ in 0..dir_count {
+            r.input
+                .read_exact(&mut record)
+                .context("Index file is truncated")?;
+            r.remaining -= 10;
+            r.sum.update(&record);
+            let parent = u32::from_le_bytes(record[0..4].try_into().unwrap());
+            let name_off = u32::from_le_bytes(record[4..8].try_into().unwrap());
+            let name_len = u16::from_le_bytes(record[8..10].try_into().unwrap());
+            if parent != NO_DIR && parent as usize >= nodes.len() {
+                bail!("Index file is inconsistent");
+            }
+            nodes.push(DirNode {
+                parent,
+                name_off,
+                name_len,
+            });
+        }
+        let dir_names = r.block()?;
+        if nodes.iter().any(|node| {
+            u64::from(node.name_off) + u64::from(node.name_len) > dir_names.len() as u64
+        }) {
+            bail!("Index file is inconsistent");
+        }
+        Dirs::from_parts(dir_names, nodes)
+    } else {
+        if dir_count.saturating_mul(8) > r.remaining {
+            bail!("Index file is inconsistent");
+        }
+        let mut paths = Vec::with_capacity(dir_count as usize);
+        for _ in 0..dir_count {
+            paths.push(r.block()?);
+        }
+        Dirs::from_full_paths(paths.iter().map(|path| path.as_slice()))
+    };
     let names = r.block()?;
     let row_count = r.u64()?;
     if row_count.saturating_mul(row_bytes as u64) != r.remaining {
@@ -371,8 +415,8 @@ mod tests {
             .unwrap();
         let (names, dirs, rows) = snapshot.entries.parts();
         w.u64(dirs.len() as u64).unwrap();
-        for dir in dirs.iter() {
-            w.block(dir).unwrap();
+        for i in 0..dirs.len() {
+            w.block(&dirs.path(i)).unwrap();
         }
         w.block(names).unwrap();
         w.u64(rows.len() as u64).unwrap();

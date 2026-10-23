@@ -847,6 +847,7 @@ struct RowView<'a> {
     table: &'a Table,
     index: usize,
     scratch: &'a mut Vec<u8>,
+    dir_scratch: &'a mut Vec<u8>,
     built: bool,
 }
 impl View for RowView<'_> {
@@ -873,7 +874,7 @@ impl View for RowView<'_> {
         self.scratch
     }
     fn parent_path(&mut self) -> Option<Vec<u8>> {
-        self.table.dir_path(self.index).map(|d| d.to_vec())
+        self.table.dir_path(self.index)
     }
     fn row(&self) -> Option<usize> {
         Some(self.index)
@@ -889,9 +890,11 @@ impl View for RowView<'_> {
         dir_hits: &[bool],
     ) -> bool {
         let dir = self.table.row(self.index).dir;
-        let Some(dir_path) = self.table.dir_path(self.index) else {
+        if dir == NO_DIR {
             return contains(self.table.name(self.index), needle, case, whole);
-        };
+        }
+        self.dir_scratch.clear();
+        self.table.dirs().write_path(dir as usize, self.dir_scratch);
         if !whole && dir_hits.get(dir as usize) == Some(&true) {
             return true;
         }
@@ -900,6 +903,7 @@ impl View for RowView<'_> {
         }
         // Remaining matches must touch the separator or the name: check the
         // last needle-1 bytes of the folder, the separator and the name.
+        let dir_path = self.dir_scratch.as_slice();
         let keep = needle.raw.len().saturating_sub(1).min(dir_path.len());
         self.scratch.clear();
         self.scratch
@@ -925,14 +929,22 @@ impl Expr {
                 dir_hits,
                 ..
             } => {
-                *dir_hits = table
-                    .dirs()
-                    .iter()
-                    .map(|d| contains(d, needle, *case, false))
-                    .collect();
+                let mut scratch = Vec::new();
+                let mut hits = Vec::with_capacity(table.dirs().len());
+                for i in 0..table.dirs().len() {
+                    table.dirs().write_path(i, &mut scratch);
+                    hits.push(contains(&scratch, needle, *case, false));
+                }
+                *dir_hits = hits;
             }
             Self::Parent { path, dirs } => {
-                *dirs = table.dirs().iter().map(|d| d == path.as_slice()).collect();
+                let mut scratch = Vec::new();
+                let mut hits = Vec::with_capacity(table.dirs().len());
+                for i in 0..table.dirs().len() {
+                    table.dirs().write_path(i, &mut scratch);
+                    hits.push(scratch == *path);
+                }
+                *dirs = hits;
             }
             Self::Child { needle, rows } => {
                 let dir_rows = table.dir_rows();
@@ -1333,11 +1345,13 @@ impl Expr {
                 if *whole || needle.raw.contains(&b'/') {
                     // The match may cross the folder/name separator.
                     let mut scratch = Vec::new();
+                    let mut dir_scratch = Vec::new();
                     per_row(&mut |index| {
                         RowView {
                             table,
                             index,
                             scratch: &mut scratch,
+                            dir_scratch: &mut dir_scratch,
                             built: false,
                         }
                         .path_contains(needle, *case, *whole, dir_hits)

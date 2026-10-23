@@ -37,42 +37,148 @@ pub struct Row {
     pub kind: Kind,
 }
 
-/// Parent folder paths packed into one buffer (two allocations in total,
-/// instead of one per folder).
+/// One directory in the parent-linked directory table. A root directory
+/// (`parent == NO_DIR`) stores its whole path as its name; every other node
+/// stores one component and is joined to its parent when a path is built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirNode {
+    pub parent: u32,
+    pub name_off: u32,
+    pub name_len: u16,
+}
+
+/// Directory names packed into one buffer plus one parent-linked node per
+/// directory (three allocations in total, instead of one per folder).
 #[derive(Clone, Debug, Default)]
 pub struct Dirs {
-    bytes: Vec<u8>,
-    ends: Vec<u32>,
+    names: Vec<u8>,
+    nodes: Vec<DirNode>,
 }
 impl Dirs {
     pub fn len(&self) -> usize {
-        self.ends.len()
+        self.nodes.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.ends.is_empty()
+        self.nodes.is_empty()
     }
-    pub fn get(&self, i: usize) -> &[u8] {
-        let start = if i == 0 { 0 } else { self.ends[i - 1] as usize };
-        &self.bytes[start..self.ends[i] as usize]
+    pub fn name(&self, i: usize) -> &[u8] {
+        let node = &self.nodes[i];
+        let start = node.name_off as usize;
+        &self.names[start..start + node.name_len as usize]
     }
-    pub fn iter(&self) -> impl Iterator<Item = &[u8]> + '_ {
-        (0..self.len()).map(move |i| self.get(i))
+    pub fn parent(&self, i: usize) -> u32 {
+        self.nodes[i].parent
     }
-    /// Returns false if the buffer would exceed 4 GiB.
-    pub fn push(&mut self, dir: &[u8]) -> bool {
-        if self.bytes.len() + dir.len() > u32::MAX as usize {
-            return false;
+    pub fn nodes(&self) -> &[DirNode] {
+        &self.nodes
+    }
+    pub fn names(&self) -> &[u8] {
+        &self.names
+    }
+    /// Writes the full path of directory `i` into `out`, replacing its contents.
+    pub fn write_path(&self, i: usize, out: &mut Vec<u8>) {
+        out.clear();
+        let mut chain = Vec::with_capacity(16);
+        let mut at = i as u32;
+        loop {
+            chain.push(at);
+            let parent = self.nodes[at as usize].parent;
+            if parent == NO_DIR {
+                break;
+            }
+            at = parent;
         }
-        self.bytes.extend_from_slice(dir);
-        self.ends.push(self.bytes.len() as u32);
-        true
+        for &node in chain.iter().rev() {
+            let name = self.name(node as usize);
+            if !out.is_empty() && !out.ends_with(b"/") && !name.starts_with(b"/") {
+                out.push(b'/');
+            }
+            out.extend_from_slice(name);
+        }
+    }
+    pub fn path(&self, i: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write_path(i, &mut out);
+        out
+    }
+    /// Finds or adds `dir`, using the scanner's stack of open ancestors so
+    /// unchanged path prefixes are shared instead of stored again.
+    pub(crate) fn intern(&mut self, ancestors: &mut Vec<(Vec<u8>, u32)>, dir: &[u8]) -> u32 {
+        let mut top = ancestors.len();
+        while top > 0 {
+            let (open, id) = &ancestors[top - 1];
+            if open.as_slice() == dir {
+                return *id;
+            }
+            if within(dir, open) {
+                break;
+            }
+            top -= 1;
+        }
+        ancestors.truncate(top);
+        if let Some((open, id)) = ancestors.last() {
+            let mut full = open.clone();
+            let mut parent = *id;
+            let rest = dir[open.len()..]
+                .strip_prefix(b"/")
+                .unwrap_or(&dir[open.len()..]);
+            for component in rest.split(|byte| *byte == b'/') {
+                if component.is_empty() {
+                    continue;
+                }
+                if !full.ends_with(b"/") {
+                    full.push(b'/');
+                }
+                full.extend_from_slice(component);
+                let Some(id) = self.push(parent, component) else {
+                    return parent;
+                };
+                parent = id;
+                ancestors.push((full.clone(), parent));
+            }
+            parent
+        } else {
+            let Some(id) = self.push(NO_DIR, dir) else {
+                return NO_DIR;
+            };
+            ancestors.push((dir.to_vec(), id));
+            id
+        }
+    }
+    pub(crate) fn from_full_paths<'a>(paths: impl Iterator<Item = &'a [u8]>) -> Self {
+        let mut dirs = Self::default();
+        let mut ancestors = Vec::new();
+        for path in paths {
+            dirs.intern(&mut ancestors, path);
+        }
+        dirs
+    }
+    pub(crate) fn from_parts(names: Vec<u8>, nodes: Vec<DirNode>) -> Self {
+        Self { names, nodes }
+    }
+    fn push(&mut self, parent: u32, name: &[u8]) -> Option<u32> {
+        if name.len() > u16::MAX as usize
+            || self.names.len() + name.len() > u32::MAX as usize
+            || self.nodes.len() >= NO_DIR as usize
+        {
+            return None;
+        }
+        let id = self.nodes.len() as u32;
+        let name_off = self.names.len() as u32;
+        self.nodes.push(DirNode {
+            parent,
+            name_off,
+            name_len: name.len() as u16,
+        });
+        self.names.extend_from_slice(name);
+        Some(id)
     }
     fn shrink_to_fit(&mut self) {
-        self.bytes.shrink_to_fit();
-        self.ends.shrink_to_fit();
+        self.names.shrink_to_fit();
+        self.nodes.shrink_to_fit();
     }
     fn heap_bytes(&self) -> usize {
-        self.bytes.capacity() + self.ends.capacity() * 4
+        self.names.capacity() + self.nodes.capacity() * std::mem::size_of::<DirNode>()
     }
 }
 
@@ -275,9 +381,20 @@ impl Table {
         let row = &self.rows[i];
         &self.names[row.name_offset as usize..row.name_offset as usize + row.name_len as usize]
     }
-    pub fn dir_path(&self, i: usize) -> Option<&[u8]> {
+    /// Appends the parent folder path of row `i` to `out`. Returns false when
+    /// the row has no parent (a filesystem root).
+    pub fn write_dir_path(&self, i: usize, out: &mut Vec<u8>) -> bool {
         let dir = self.rows[i].dir;
-        (dir != NO_DIR).then(|| self.dirs.get(dir as usize))
+        out.clear();
+        if dir == NO_DIR {
+            return false;
+        }
+        self.dirs.write_path(dir as usize, out);
+        true
+    }
+    pub fn dir_path(&self, i: usize) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        self.write_dir_path(i, &mut out).then_some(out)
     }
     pub fn dirs(&self) -> &Dirs {
         &self.dirs
@@ -285,9 +402,9 @@ impl Table {
     /// Writes the full path of row `i` into `out`, replacing its contents.
     pub fn write_path(&self, i: usize, out: &mut Vec<u8>) {
         out.clear();
-        if let Some(dir) = self.dir_path(i) {
-            out.extend_from_slice(dir);
-            if !dir.ends_with(b"/") {
+        if self.rows[i].dir != NO_DIR {
+            self.dirs.write_path(self.rows[i].dir as usize, out);
+            if !out.ends_with(b"/") {
                 out.push(b'/');
             }
         }
@@ -307,21 +424,27 @@ impl Table {
     }
     /// Whether folder row `i` has no indexed entries inside it.
     pub fn is_empty_folder(&self, i: usize) -> bool {
-        self.rows[i].kind == Kind::Folder
-            && match self.rows.get(i + 1) {
-                None => true,
-                Some(next) => {
-                    let mut path = Vec::new();
-                    self.write_path(i, &mut path);
-                    next.dir == NO_DIR || self.dirs.get(next.dir as usize) != path.as_slice()
-                }
-            }
+        if self.rows[i].kind != Kind::Folder {
+            return false;
+        }
+        let Some(next) = self.rows.get(i + 1) else {
+            return true;
+        };
+        if next.dir == NO_DIR {
+            return true;
+        }
+        let mut path = Vec::new();
+        self.write_path(i, &mut path);
+        let mut dir_path = Vec::new();
+        self.dirs.write_path(next.dir as usize, &mut dir_path);
+        dir_path != path
     }
     /// For each parent folder path (by `dir` id), the row of that folder, or
     /// `u32::MAX` when the folder itself is not indexed (a root's parent).
     pub fn dir_rows(&self) -> Vec<u32> {
         let mut dir_rows = vec![u32::MAX; self.dirs.len()];
         let mut path = Vec::new();
+        let mut dir_path = Vec::new();
         for j in 1..self.rows.len() {
             let dir = self.rows[j].dir;
             // The first child follows its folder directly in path order, so
@@ -331,7 +454,8 @@ impl Table {
                 && self.rows[j - 1].kind == Kind::Folder
             {
                 self.write_path(j - 1, &mut path);
-                if self.dirs.get(dir as usize) == path.as_slice() {
+                self.dirs.write_path(dir as usize, &mut dir_path);
+                if dir_path == path {
                     dir_rows[dir as usize] = (j - 1) as u32;
                 }
             }
@@ -601,7 +725,7 @@ pub struct Builder {
     names: Vec<u8>,
     dirs: Dirs,
     rows: Vec<Row>,
-    ancestors: Vec<u32>,
+    ancestors: Vec<(Vec<u8>, u32)>,
 }
 impl Default for Builder {
     fn default() -> Self {
@@ -624,24 +748,7 @@ impl Builder {
         self.rows.is_empty()
     }
     fn intern(&mut self, dir: &[u8]) -> u32 {
-        while let Some(&top) = self.ancestors.last() {
-            let open = self.dirs.get(top as usize);
-            if open == dir {
-                return top;
-            }
-            if within(dir, open) {
-                break;
-            }
-            self.ancestors.pop();
-        }
-        let id = self.dirs.len() as u32;
-        // Over 4 GiB of folder paths is not a realistic index; keep going
-        // with the last folder rather than failing the whole scan.
-        if !self.dirs.push(dir) {
-            return id.saturating_sub(1);
-        }
-        self.ancestors.push(id);
-        id
+        self.dirs.intern(&mut self.ancestors, dir)
     }
     /// Returns false when the name is too long to store (over 65535 bytes,
     /// far beyond Linux's 255-byte limit) or the buffer would overflow.
@@ -690,13 +797,15 @@ impl Builder {
         let shift = self.names.len() as i64 - first as i64;
         self.names.extend_from_slice(&table.names[first..stop]);
         let (mut old_dir, mut new_dir) = (NO_DIR, NO_DIR);
+        let mut dir_path = Vec::new();
         for row in &table.rows[start..end] {
             if row.dir != old_dir {
                 old_dir = row.dir;
                 new_dir = if row.dir == NO_DIR {
                     NO_DIR
                 } else {
-                    self.intern(table.dirs.get(row.dir as usize))
+                    table.dirs.write_path(row.dir as usize, &mut dir_path);
+                    self.intern(&dir_path)
                 };
             }
             self.rows.push(Row {
@@ -710,7 +819,7 @@ impl Builder {
     pub fn push_from(&mut self, table: &Table, i: usize) {
         let row = table.rows[i];
         let dir = match table.dir_path(i) {
-            Some(dir) => self.intern(dir),
+            Some(dir) => self.intern(&dir),
             None => NO_DIR,
         };
         let name_offset = self.names.len() as u32;
@@ -764,7 +873,7 @@ impl Table {
                 current_dir = row.dir;
                 dir_path.clear();
                 if row.dir != NO_DIR {
-                    dir_path.extend_from_slice(self.dirs.get(row.dir as usize));
+                    self.dirs.write_path(row.dir as usize, &mut dir_path);
                 }
                 while open
                     .last()
