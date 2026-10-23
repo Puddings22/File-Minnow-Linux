@@ -36,7 +36,10 @@ const MASK: u64 = libc::FAN_CREATE
 pub struct FanotifyWatcher {
     fd: i32,
     wake: i32,
+    stop: i32,
     thread: Option<JoinHandle<()>>,
+    callback: Option<Arc<dyn Fn(Signal) + Send + Sync>>,
+    mount_fds: Vec<i32>,
     folders: AtomicUsize,
     errors: Arc<Mutex<(Vec<String>, usize)>>,
 }
@@ -99,11 +102,12 @@ impl FanotifyWatcher {
                 unsafe { libc::close(fd) };
                 return Err(error);
             }
-            // SAFETY: opening the root read-only with O_PATH.
+            // SAFETY: opening the root read-only; the descriptor is only a
+            // reference for open_by_handle_at.
             let mount_fd = unsafe {
                 libc::open(
                     name.as_ptr(),
-                    libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
                 )
             };
             if mount_fd < 0 {
@@ -133,20 +137,38 @@ impl FanotifyWatcher {
             return Err(error);
         }
         let (stop_read, stop_write) = (pipe[0], pipe[1]);
-        let errors = Arc::new(Mutex::new((Vec::new(), 0)));
-        let thread_errors = errors.clone();
-        let thread = thread::Builder::new()
-            .name("file-minnow-fanotify".into())
-            .spawn(move || {
-                run(fd, stop_read, mount_fds, on_signal, thread_errors);
-            })?;
         Ok(Self {
             fd,
             wake: stop_write,
-            thread: Some(thread),
+            stop: stop_read,
+            thread: None,
+            callback: Some(on_signal),
+            mount_fds,
             folders: AtomicUsize::new(0),
-            errors,
+            errors: Arc::new(Mutex::new((Vec::new(), 0))),
         })
+    }
+
+    /// Starts the event thread. Call this after dropping root so the new
+    /// thread inherits the capability needed to resolve file handles.
+    pub fn start(&mut self) {
+        if self.thread.is_some() {
+            return;
+        }
+        let Some(on_signal) = self.callback.take() else {
+            return;
+        };
+        let mount_fds = std::mem::take(&mut self.mount_fds);
+        let stop = self.stop;
+        let fd = self.fd;
+        let errors = self.errors.clone();
+        match thread::Builder::new()
+            .name("file-minnow-fanotify".into())
+            .spawn(move || run(fd, stop, mount_fds, on_signal, errors))
+        {
+            Ok(thread) => self.thread = Some(thread),
+            Err(error) => self.record_error(format!("cannot start fanotify thread: {error}")),
+        }
     }
 
     pub fn begin_sweep(&self) -> u32 {
@@ -161,7 +183,9 @@ impl FanotifyWatcher {
         self.folders.load(Ordering::Relaxed)
     }
     pub fn errors(&self) -> (Vec<String>, usize) {
-        self.errors.lock().unwrap().clone()
+        // Resolution failures are reported in the message list; they do not
+        // mean that folders are unmonitored (there is one mark per filesystem).
+        (self.errors.lock().unwrap().0.clone(), 0)
     }
     pub fn record_error(&self, message: String) {
         let mut errors = self.errors.lock().unwrap();
@@ -182,6 +206,12 @@ impl Drop for FanotifyWatcher {
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        } else {
+            // The event thread was never started, so it did not close
+            // these descriptors.
+            // SAFETY: closing our own descriptors.
+            unsafe { libc::close(self.stop) };
+            close_all(&self.mount_fds);
         }
     }
 }
@@ -198,7 +228,7 @@ fn run(
     stop: i32,
     mount_fds: Vec<i32>,
     on_signal: Arc<dyn Fn(Signal) + Send + Sync>,
-    _errors: Arc<Mutex<(Vec<String>, usize)>>,
+    errors: Arc<Mutex<(Vec<String>, usize)>>,
 ) {
     let mut poll = [
         libc::pollfd {
@@ -213,6 +243,7 @@ fn run(
         },
     ];
     let mut buffer = vec![0_u8; 128 * 1024];
+    let mut unresolved = 0_u32;
     loop {
         // SAFETY: `poll` has two initialized entries.
         let ready = unsafe { libc::poll(poll.as_mut_ptr(), 2, -1) };
@@ -258,8 +289,28 @@ fn run(
                     overflow = true;
                 } else {
                     match resolve_event(event, &mount_fds) {
-                        Some(path) => changed.push(path),
-                        None => overflow = true,
+                        Some(path) => {
+                            unresolved = 0;
+                            changed.push(path);
+                        }
+                        None => {
+                            // A handle for a file that vanished (the index
+                            // save renames a temporary file) is normal. Only
+                            // report a run of failures, which means handle
+                            // resolution is not working at all.
+                            unresolved += 1;
+                            if unresolved >= 8 {
+                                let mut state = errors.lock().unwrap();
+                                if state.0.is_empty() {
+                                    state.0.push(
+                                        "fanotify could not resolve events; periodic rescans will catch up"
+                                            .into(),
+                                    );
+                                }
+                                state.1 += 1;
+                                unresolved = 0;
+                            }
+                        }
                     }
                 }
                 offset += event_len;

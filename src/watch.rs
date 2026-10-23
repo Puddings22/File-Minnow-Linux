@@ -339,6 +339,12 @@ impl Watcher {
             fallback,
         })
     }
+    pub fn start(&mut self) {
+        match &mut self.backend {
+            Backend::Inotify(_) => {}
+            Backend::Fanotify(watcher) => watcher.start(),
+        }
+    }
     pub fn begin_sweep(&self) -> u32 {
         match &self.backend {
             Backend::Inotify(watcher) => watcher.begin_sweep(),

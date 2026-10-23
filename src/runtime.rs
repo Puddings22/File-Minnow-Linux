@@ -491,7 +491,7 @@ impl Worker {
         let tx = self.tx.clone();
         let event_policy = Arc::new(RwLock::new(EventPolicy::new(&config)?));
         let policy = event_policy.clone();
-        let watcher = Watcher::new_with_mode(
+        let mut watcher = Watcher::new_with_mode(
             move |signal| {
                 match signal {
                     Signal::Overflow => over.store(true, Ordering::Relaxed),
@@ -515,11 +515,15 @@ impl Worker {
             &config.paths(),
         )
         .ok();
-        if let Some(watcher) = &watcher
+        if let Some(watcher) = &mut watcher
             && watcher.is_fanotify()
-            && let Err(error) = crate::fanotify::drop_to_invoker(dir)
         {
-            watcher.record_error(format!("cannot drop privileges: {error}"));
+            if let Err(error) = crate::fanotify::drop_to_invoker(dir) {
+                watcher.record_error(format!("cannot drop privileges: {error}"));
+            }
+            // Spawn after the drop so the event thread inherits
+            // CAP_DAC_READ_SEARCH and can resolve file handles.
+            watcher.start();
         }
         if watcher.is_none() && config_monitors(&config) {
             state.write().unwrap().status.watch_errors = vec![
