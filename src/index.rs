@@ -30,6 +30,22 @@ impl Kind {
             Self::Other => "other",
         }
     }
+    pub(crate) fn bits(self) -> u32 {
+        match self {
+            Self::File => 0,
+            Self::Folder => 1,
+            Self::Link => 2,
+            Self::Other => 3,
+        }
+    }
+    pub(crate) fn from_bits(bits: u32) -> Self {
+        match bits {
+            0 => Self::File,
+            1 => Self::Folder,
+            2 => Self::Link,
+            _ => Self::Other,
+        }
+    }
 }
 impl From<&str> for Kind {
     fn from(s: &str) -> Self {
@@ -396,9 +412,10 @@ pub fn scan_config_watched(
         .filter(|r| r.enabled)
         .map(|r| r.path.0.clone())
         .collect();
+    let entries = builder.finish();
     let mut snapshot = Snapshot {
         roots: roots.clone(),
-        entries: builder.finish(),
+        entries,
         generation,
         scanned_at: now(),
         errors,
@@ -707,6 +724,56 @@ fn scan_list(
     }
 }
 
+/// Whether a quick scan would find any folder whose modification time
+/// changed. This is the same folder walk as the quick scan, but without
+/// copying the table, so an unchanged index can stay mapped.
+pub fn quick_scan_needed(
+    config: &crate::config::IndexConfig,
+    previous: &Snapshot,
+    watch: WatchHook,
+) -> Result<bool> {
+    let table = &previous.entries;
+    let changed_after = previous.saved_at as i64 - 2;
+    let mut path = Vec::new();
+    for root_config in config.roots.iter().filter(|r| r.enabled) {
+        let root = root_config.path.path();
+        let bytes = root.as_os_str().as_bytes();
+        let start = table.lower_bound(bytes);
+        let indexed = start < table.len()
+            && table.path(start) == bytes
+            && table.row(start).kind() == Kind::Folder;
+        if !root_config.recursive
+            || !indexed
+            || root_config.list.is_some()
+            || (root_config.keep_offline && is_offline(&root))
+        {
+            return Ok(true);
+        }
+        let end = table.subtree_end(start, bytes);
+        for index in start..end {
+            if table.row(index).kind() != Kind::Folder {
+                continue;
+            }
+            table.write_path(index, &mut path);
+            let folder = Path::new(std::ffi::OsStr::from_bytes(&path));
+            if let Some(watch) = watch {
+                watch(folder);
+            }
+            let metadata = match fs::symlink_metadata(folder) {
+                Ok(metadata) => metadata,
+                Err(_) => return Ok(true),
+            };
+            let modified = metadata.mtime();
+            if u32::try_from(modified).ok() != Some(table.row(index).modified)
+                || modified >= changed_after
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Start-up catch-up from a saved index. Every indexed folder is checked
 /// (and watched) again, but only the folders whose modification time
 /// changed since the index was saved are read; the others keep their saved
@@ -722,6 +789,9 @@ pub fn quick_scan(
     progress: &dyn Fn(usize),
     watch: WatchHook,
 ) -> Result<Option<Snapshot>> {
+    if !quick_scan_needed(config, previous, watch)? {
+        return Ok(Some(previous.clone()));
+    }
     let rules = crate::config::PatternRules::new(config)?;
     let table = &previous.entries;
     let mut builder = Builder::with_capacity(table.len());
@@ -737,7 +807,7 @@ pub fn quick_scan(
         let start = table.lower_bound(bytes);
         let indexed = start < table.len()
             && table.path(start) == bytes
-            && table.row(start).kind == Kind::Folder;
+            && table.row(start).kind() == Kind::Folder;
         let mut log = ScanLog {
             errors: &mut errors,
             count: &mut error_count,
@@ -880,14 +950,14 @@ impl Quick<'_, '_> {
         if !meta.is_dir() {
             return self.walk(path);
         }
-        let unchanged =
-            meta.mtime() == self.table.row(row).modified && meta.mtime() < self.changed_after;
+        let unchanged = u32::try_from(meta.mtime()).ok() == Some(self.table.row(row).modified)
+            && meta.mtime() < self.changed_after;
         if unchanged {
             // The folder's own entries are as saved; its subfolders are
             // checked in turn.
             let (mut i, mut run) = (row + 1, row);
             while i < end {
-                if self.table.row(i).kind != Kind::Folder {
+                if self.table.row(i).kind() != Kind::Folder {
                     i += 1;
                     continue;
                 }
@@ -951,7 +1021,7 @@ impl Quick<'_, '_> {
                 let bytes = child.as_os_str().as_bytes();
                 let at = self.table.lower_bound(bytes);
                 let known = at < end
-                    && self.table.row(at).kind == Kind::Folder
+                    && self.table.row(at).kind() == Kind::Folder
                     && self.table.path(at) == bytes;
                 let completed = if known {
                     let child_end = self.table.subtree_end(at, bytes);

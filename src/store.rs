@@ -1,14 +1,16 @@
 use crate::{
-    index::{Kind, Snapshot},
-    table::{DirNode, Dirs, NO_DIR, Row, Table},
+    index::Snapshot,
+    table::{MappedSlice, Row, Table},
 };
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
+use memmap2::Mmap;
 use std::{
     fs::{self, DirBuilder, File, OpenOptions},
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufWriter, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 pub fn default_dir() -> PathBuf {
@@ -64,15 +66,20 @@ pub fn writer_lock(dir: &Path) -> Result<File> {
     Ok(file)
 }
 const INDEX: &str = "index.bin";
-const MAGIC: &[u8; 8] = b"FMNIDX05";
-/// Parent paths were stored as whole strings before 0.10; still read and
-/// converted to parent-linked nodes on load.
-const MAGIC_04: &[u8; 8] = b"FMNIDX04";
-/// The previous layout, without item counts: still read, and the counts
-/// computed on load.
-const MAGIC_03: &[u8; 8] = b"FMNIDX03";
-/// Earlier layouts of the same file; only a cache, so they are rebuilt.
-const OLD_MAGICS: [&[u8; 8]; 1] = [b"FMNIDX02"];
+const MAGIC: &[u8; 8] = b"FMNIDX07";
+/// Older layouts are a cache; they are rebuilt instead of read.
+const OLD_MAGICS: [&[u8; 8]; 5] = [
+    b"FMNIDX02",
+    b"FMNIDX03",
+    b"FMNIDX04",
+    b"FMNIDX05",
+    b"FMNIDX06",
+];
+const ROW_BYTES: usize = std::mem::size_of::<Row>();
+const DIR_NODE_BYTES: usize = std::mem::size_of::<crate::table::DirNode>();
+const ITEM_BYTES: usize = 8;
+/// Offsets and lengths of the five mapped sections.
+const TABLE_VALUES: usize = 10;
 /// Files from older versions. They are only a cache, so they are deleted.
 const LEGACY: [&str; 4] = [
     "index.sqlite",
@@ -115,84 +122,75 @@ pub fn quarantine(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A fast, order-sensitive checksum; it detects truncation and corruption,
-/// not deliberate tampering (the file is private to the user).
-struct Checksum(u64);
+/// A fast streaming checksum; it detects truncation and corruption, not
+/// deliberate tampering (the file is private to the user).
+struct Checksum(xxhash_rust::xxh3::Xxh3);
 impl Checksum {
-    // `as_chunks` needs a newer MSRV than the rest of the crate.
-    #[allow(clippy::chunks_exact_to_as_chunks)]
+    fn new() -> Self {
+        Self(xxhash_rust::xxh3::Xxh3::new())
+    }
     fn update(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in &mut chunks {
-            let word = u64::from_le_bytes(chunk.try_into().unwrap());
-            self.0 = (self.0 ^ word)
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .rotate_left(27);
-        }
-        for &byte in chunks.remainder() {
-            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3);
-        }
-        self.0 ^= bytes.len() as u64;
+        self.0.update(bytes);
+    }
+    fn digest(&self) -> u64 {
+        self.0.digest()
     }
 }
 
 struct Writer<W: Write> {
     out: W,
     sum: Checksum,
+    pending: Vec<u8>,
 }
 impl<W: Write> Writer<W> {
+    fn new(out: W) -> Self {
+        Self {
+            out,
+            sum: Checksum::new(),
+            pending: Vec::with_capacity(64 * 1024),
+        }
+    }
     fn bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        self.sum.update(bytes);
-        self.out.write_all(bytes)?;
+        self.pending.extend_from_slice(bytes);
+        if self.pending.len() >= 64 * 1024 {
+            self.flush()?;
+        }
+        Ok(())
+    }
+    fn flush(&mut self) -> Result<()> {
+        if !self.pending.is_empty() {
+            self.sum.update(&self.pending);
+            self.out.write_all(&self.pending)?;
+            self.pending.clear();
+        }
         Ok(())
     }
     fn u64(&mut self, value: u64) -> Result<()> {
         self.bytes(&value.to_le_bytes())
     }
-    fn block(&mut self, bytes: &[u8]) -> Result<()> {
-        self.u64(bytes.len() as u64)?;
-        self.bytes(bytes)
-    }
 }
 
-struct Reader<R: Read> {
-    input: R,
-    sum: Checksum,
-    remaining: u64,
+const ZEROS: [u8; 8] = [0; 8];
+fn pad_to<W: Write>(writer: &mut Writer<W>, at: &mut usize, target: usize) -> Result<()> {
+    let count = target
+        .checked_sub(*at)
+        .context("Index layout is inconsistent")?;
+    if count > ZEROS.len() {
+        bail!("Index layout is inconsistent");
+    }
+    if count > 0 {
+        writer.bytes(&ZEROS[..count])?;
+        *at += count;
+    }
+    Ok(())
 }
-impl<R: Read> Reader<R> {
-    fn bytes(&mut self, len: u64) -> Result<Vec<u8>> {
-        if len > self.remaining {
-            bail!("Index file is truncated");
-        }
-        let mut buffer = vec![0; len as usize];
-        self.input.read_exact(&mut buffer)?;
-        self.remaining -= len;
-        self.sum.update(&buffer);
-        Ok(buffer)
-    }
-    fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
-    }
-    fn block(&mut self) -> Result<Vec<u8>> {
-        let len = self.u64()?;
-        self.bytes(len)
-    }
-}
-
-const ROW_BYTES: usize = 39;
-const ROW_BYTES_03: usize = 35;
-fn kind_byte(kind: Kind) -> u8 {
-    match kind {
-        Kind::File => 0,
-        Kind::Folder => 1,
-        Kind::Link => 2,
-        Kind::Other => 3,
-    }
+fn align8(value: usize) -> usize {
+    (value + 7) & !7
 }
 
 /// Writes the whole snapshot to a temporary file and renames it into place,
 /// so a crash leaves either the previous index or the new one, never a mix.
+/// The file is laid out in aligned sections so it can be mapped on load.
 pub fn save(dir: &Path, snapshot: &Snapshot) -> Result<()> {
     let target = dir.join(INDEX);
     let temp = dir.join(format!("{INDEX}.tmp-{}", std::process::id()));
@@ -203,42 +201,92 @@ pub fn save(dir: &Path, snapshot: &Snapshot) -> Result<()> {
             .truncate(true)
             .mode(0o600)
             .open(&temp)?;
-        let mut w = Writer {
-            out: BufWriter::with_capacity(1 << 20, file),
-            sum: Checksum(0),
-        };
-        w.out.write_all(MAGIC)?;
+        let mut writer = Writer::new(BufWriter::with_capacity(1 << 20, file));
         let mut header = snapshot.header();
         header.saved_at = crate::index::now();
-        w.block(&serde_json::to_vec(&header)?)?;
+        let json = serde_json::to_vec(&header)?;
         let (names, dirs, rows) = snapshot.entries.parts();
-        w.u64(dirs.len() as u64)?;
-        let mut node = [0_u8; 10];
+        let items = snapshot.entries.item_entries();
+
+        let table_off = align8(16 + json.len());
+        let dir_nodes_off = table_off + TABLE_VALUES * 8;
+        let dir_nodes_len = dirs.len() * DIR_NODE_BYTES;
+        let dir_names_off = align8(dir_nodes_off + dir_nodes_len);
+        let dir_names_len = dirs.names().len();
+        let names_off = align8(dir_names_off + dir_names_len);
+        let names_len = names.len();
+        let rows_off = align8(names_off + names_len);
+        let rows_len = rows.len() * ROW_BYTES;
+        let items_off = align8(rows_off + rows_len);
+        let items_len = items.len() * ITEM_BYTES;
+        let checksum_off = align8(items_off + items_len);
+
+        let mut at = 0;
+        writer.out.write_all(MAGIC)?;
+        at += MAGIC.len();
+        writer.u64(json.len() as u64)?;
+        at += 8;
+        writer.bytes(&json)?;
+        at += json.len();
+        pad_to(&mut writer, &mut at, table_off)?;
+        for value in [
+            dir_nodes_off,
+            dir_nodes_len,
+            dir_names_off,
+            dir_names_len,
+            names_off,
+            names_len,
+            rows_off,
+            rows_len,
+            items_off,
+            items_len,
+        ] {
+            writer.u64(value as u64)?;
+            at += 8;
+        }
+        pad_to(&mut writer, &mut at, dir_nodes_off)?;
+        let mut node = [0_u8; DIR_NODE_BYTES];
         for dir in dirs.nodes() {
             node[0..4].copy_from_slice(&dir.parent.to_le_bytes());
             node[4..8].copy_from_slice(&dir.name_off.to_le_bytes());
             node[8..10].copy_from_slice(&dir.name_len.to_le_bytes());
-            w.bytes(&node)?;
+            node[10..12].copy_from_slice(&dir._pad.to_le_bytes());
+            writer.bytes(&node)?;
+            at += DIR_NODE_BYTES;
         }
-        w.block(dirs.names())?;
-        w.block(names)?;
-        w.u64(rows.len() as u64)?;
+        pad_to(&mut writer, &mut at, dir_names_off)?;
+        writer.bytes(dirs.names())?;
+        at += dir_names_len;
+        pad_to(&mut writer, &mut at, names_off)?;
+        writer.bytes(names)?;
+        at += names_len;
+        pad_to(&mut writer, &mut at, rows_off)?;
         let mut record = [0_u8; ROW_BYTES];
         for row in rows {
-            let (offset, len) = row.name_range();
             record[0..8].copy_from_slice(&row.size.to_le_bytes());
-            record[8..16].copy_from_slice(&row.modified.to_le_bytes());
-            record[16..20].copy_from_slice(&offset.to_le_bytes());
-            record[20..24].copy_from_slice(&row.dir.to_le_bytes());
-            record[24..26].copy_from_slice(&len.to_le_bytes());
-            record[26] = kind_byte(row.kind);
-            record[27..35].copy_from_slice(&row.created.to_le_bytes());
-            record[35..39].copy_from_slice(&row.items.to_le_bytes());
-            w.bytes(&record)?;
+            record[8..12].copy_from_slice(&row.modified.to_le_bytes());
+            record[12..16].copy_from_slice(&row.created_raw().to_le_bytes());
+            record[16..20].copy_from_slice(&row.name_offset().to_le_bytes());
+            record[20..24].copy_from_slice(&row.dir_kind().to_le_bytes());
+            writer.bytes(&record)?;
+            at += ROW_BYTES;
         }
-        let sum = w.sum.0;
-        w.out.write_all(&sum.to_le_bytes())?;
-        let file = w.out.into_inner().map_err(|e| e.into_error())?;
+        pad_to(&mut writer, &mut at, items_off)?;
+        let mut pair = [0_u8; ITEM_BYTES];
+        for (row, count) in items {
+            pair[0..4].copy_from_slice(&row.to_le_bytes());
+            pair[4..8].copy_from_slice(&count.to_le_bytes());
+            writer.bytes(&pair)?;
+            at += ITEM_BYTES;
+        }
+        pad_to(&mut writer, &mut at, checksum_off)?;
+        if at != checksum_off {
+            bail!("Index layout is inconsistent");
+        }
+        writer.flush()?;
+        let sum = writer.sum.digest();
+        writer.out.write_all(&sum.to_le_bytes())?;
+        let file = writer.out.into_inner().map_err(|e| e.into_error())?;
         file.sync_all()?;
         fs::rename(&temp, &target)?;
         File::open(dir)?.sync_all()?;
@@ -250,8 +298,9 @@ pub fn save(dir: &Path, snapshot: &Snapshot) -> Result<()> {
     result
 }
 
-/// Loads the saved index. A missing file is an empty index; an unreadable or
-/// inconsistent one is an error so the caller can quarantine and rebuild it.
+/// Loads the saved index, mapping its data sections instead of copying them.
+/// A missing file is an empty index; an unreadable or inconsistent one is an
+/// error so the caller can quarantine and rebuild it.
 pub fn load(dir: &Path) -> Result<Snapshot> {
     let path = dir.join(INDEX);
     let file = match File::open(&path) {
@@ -259,188 +308,112 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Snapshot::default()),
         Err(e) => return Err(e.into()),
     };
-    let size = file.metadata()?.len();
-    let mut input = BufReader::with_capacity(1 << 20, file);
-    let mut magic = [0_u8; 8];
-    input
-        .read_exact(&mut magic)
-        .context("Index file is truncated")?;
-    if OLD_MAGICS.contains(&&magic) {
+    if file.metadata()?.len() < 8 {
+        bail!("Index file is truncated");
+    }
+    // SAFETY: the index file is private to the user and is never written in
+    // place; a replacement happens through rename.
+    let map = unsafe { Mmap::map(&file)? };
+    let magic: &[u8; 8] = map[0..8].try_into().unwrap();
+    if OLD_MAGICS.contains(&magic) {
         // A previous version's cache: start empty, the next save replaces it.
         return Ok(Snapshot::default());
     }
-    if &magic != MAGIC && &magic != MAGIC_04 && &magic != MAGIC_03 {
+    if magic != MAGIC {
         bail!("Unknown index format; it will be rebuilt");
     }
-    let row_bytes = if &magic == MAGIC_03 {
-        ROW_BYTES_03
-    } else {
-        ROW_BYTES
-    };
-    let parent_linked = &magic == MAGIC;
-    let mut r = Reader {
-        input,
-        sum: Checksum(0),
-        remaining: size.saturating_sub(16),
-    };
-    let mut snapshot: Snapshot = serde_json::from_slice(&r.block()?)?;
-    let dir_count = r.u64()?;
-    if dir_count >= u64::from(NO_DIR) {
-        bail!("Index file is inconsistent");
+    if map.len() < 24 {
+        bail!("Index file is truncated");
     }
-    let dirs = if parent_linked {
-        if dir_count.saturating_mul(10) > r.remaining {
+    let header_len = u64::from_le_bytes(map[8..16].try_into().unwrap()) as usize;
+    let header_end = 16_usize
+        .checked_add(header_len)
+        .context("Index file is inconsistent")?;
+    if header_end > map.len() {
+        bail!("Index file is truncated");
+    }
+    let mut snapshot: Snapshot = serde_json::from_slice(&map[16..header_end])?;
+    let table_off = align8(header_end);
+    let table_end = table_off
+        .checked_add(TABLE_VALUES * 8)
+        .context("Index file is inconsistent")?;
+    if table_end > map.len() {
+        bail!("Index file is truncated");
+    }
+    let mut values = [0_u64; TABLE_VALUES];
+    for (index, value) in values.iter_mut().enumerate() {
+        let start = table_off + index * 8;
+        *value = u64::from_le_bytes(map[start..start + 8].try_into().unwrap());
+    }
+    let [
+        dir_nodes_off,
+        dir_nodes_len,
+        dir_names_off,
+        dir_names_len,
+        names_off,
+        names_len,
+        rows_off,
+        rows_len,
+        items_off,
+        items_len,
+    ] = values.map(|value| value as usize);
+    let checksum_off = map.len() - 8;
+    let check = |offset: usize, len: usize, alignment: usize, multiple: usize| -> Result<()> {
+        let end = offset
+            .checked_add(len)
+            .context("Index file is inconsistent")?;
+        if !offset.is_multiple_of(alignment) || !len.is_multiple_of(multiple) || end > checksum_off
+        {
             bail!("Index file is inconsistent");
         }
-        let mut nodes = Vec::with_capacity(dir_count as usize);
-        let mut record = [0_u8; 10];
-        for _ in 0..dir_count {
-            r.input
-                .read_exact(&mut record)
-                .context("Index file is truncated")?;
-            r.remaining -= 10;
-            r.sum.update(&record);
-            let parent = u32::from_le_bytes(record[0..4].try_into().unwrap());
-            let name_off = u32::from_le_bytes(record[4..8].try_into().unwrap());
-            let name_len = u16::from_le_bytes(record[8..10].try_into().unwrap());
-            if parent != NO_DIR && parent as usize >= nodes.len() {
-                bail!("Index file is inconsistent");
-            }
-            nodes.push(DirNode {
-                parent,
-                name_off,
-                name_len,
-            });
-        }
-        let dir_names = r.block()?;
-        if nodes.iter().any(|node| {
-            u64::from(node.name_off) + u64::from(node.name_len) > dir_names.len() as u64
-        }) {
-            bail!("Index file is inconsistent");
-        }
-        Dirs::from_parts(dir_names, nodes)
-    } else {
-        if dir_count.saturating_mul(8) > r.remaining {
-            bail!("Index file is inconsistent");
-        }
-        let mut paths = Vec::with_capacity(dir_count as usize);
-        for _ in 0..dir_count {
-            paths.push(r.block()?);
-        }
-        Dirs::from_full_paths(paths.iter().map(|path| path.as_slice()))
+        Ok(())
     };
-    let names = r.block()?;
-    let row_count = r.u64()?;
-    if row_count.saturating_mul(row_bytes as u64) != r.remaining {
-        bail!("Index file is inconsistent");
-    }
-    let mut rows = Vec::with_capacity(row_count as usize);
-    let mut next_name = 0_u32;
-    // Read rows in large blocks; the checksum still covers each record.
-    let mut block = vec![0_u8; row_bytes * 65_536];
-    let mut left = row_count as usize;
-    while left > 0 {
-        let count = left.min(65_536);
-        let block = &mut block[..count * row_bytes];
-        r.input
-            .read_exact(block)
-            .context("Index file is truncated")?;
-        r.remaining -= block.len() as u64;
-        left -= count;
-        for record in block.chunks_exact(row_bytes) {
-            r.sum.update(record);
-            let field = |range: std::ops::Range<usize>| &record[range];
-            let size = u64::from_le_bytes(field(0..8).try_into().unwrap());
-            let modified = i64::from_le_bytes(field(8..16).try_into().unwrap());
-            let offset = u32::from_le_bytes(field(16..20).try_into().unwrap());
-            let dir = u32::from_le_bytes(field(20..24).try_into().unwrap());
-            let len = u16::from_le_bytes(field(24..26).try_into().unwrap());
-            let created = i64::from_le_bytes(field(27..35).try_into().unwrap());
-            let items = if row_bytes == ROW_BYTES {
-                u32::from_le_bytes(field(35..39).try_into().unwrap())
-            } else {
-                0
-            };
-            let kind = match record[26] {
-                0 => Kind::File,
-                1 => Kind::Folder,
-                2 => Kind::Link,
-                3 => Kind::Other,
-                _ => bail!("Index file is inconsistent"),
-            };
-            // Names are stored back to back in row order; searches rely on it.
-            if offset != next_name
-                || offset as usize + len as usize > names.len()
-                || (dir != NO_DIR && dir as usize >= dirs.len())
-            {
-                bail!("Index file is inconsistent");
-            }
-            next_name = offset + u32::from(len);
-            rows.push(Row::from_raw(
-                size, modified, created, offset, dir, items, len, kind,
-            ));
-        }
-    }
-    if next_name as usize != names.len() {
-        bail!("Index file is inconsistent");
-    }
-    let expected = r.sum.0;
-    let mut stored = [0_u8; 8];
-    r.input
-        .read_exact(&mut stored)
-        .context("Index file is truncated")?;
-    if u64::from_le_bytes(stored) != expected {
+    check(dir_nodes_off, dir_nodes_len, 4, DIR_NODE_BYTES)?;
+    check(dir_names_off, dir_names_len, 1, 1)?;
+    check(names_off, names_len, 1, 1)?;
+    check(rows_off, rows_len, 8, ROW_BYTES)?;
+    check(items_off, items_len, 4, ITEM_BYTES)?;
+
+    let mut checksum = Checksum::new();
+    checksum.update(&map[8..checksum_off]);
+    let stored = u64::from_le_bytes(map[checksum_off..].try_into().unwrap());
+    if checksum.digest() != stored {
         bail!("Index checksum mismatch; it will be rebuilt");
     }
-    snapshot.entries = Table::from_parts(names, dirs, rows);
-    if row_bytes == ROW_BYTES_03 {
-        snapshot.entries.sum_folder_sizes();
+
+    let row_count = rows_len / ROW_BYTES;
+    let mut items = Vec::with_capacity(items_len / ITEM_BYTES);
+    // `as_chunks` needs a newer MSRV than the rest of the crate.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
+    for chunk in map[items_off..items_off + items_len].chunks_exact(ITEM_BYTES) {
+        let row = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+        let count = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+        if row as usize >= row_count || items.last().is_some_and(|(last, _)| *last >= row) {
+            bail!("Index file is inconsistent");
+        }
+        items.push((row, count));
     }
+
+    let map = Arc::new(map);
+    let names = MappedSlice::new(map.clone(), names_off, names_len);
+    let dir_names = MappedSlice::new(map.clone(), dir_names_off, dir_names_len);
+    let dir_nodes = MappedSlice::new(map.clone(), dir_nodes_off, dir_nodes_len);
+    let rows = MappedSlice::new(map.clone(), rows_off, rows_len);
+    let dirs = crate::table::Dirs::from_mapped(dir_names, dir_nodes)
+        .context("Index file is inconsistent")?;
+    snapshot.entries =
+        Table::from_mapped(names, dirs, rows, items).context("Index file is inconsistent")?;
     Ok(snapshot)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::Entry;
-    /// Writes `snapshot` in the 0.8 layout (FMNIDX03: no item counts).
-    fn save_03(dir: &Path, snapshot: &Snapshot) {
-        let mut out = Vec::new();
-        let mut w = Writer {
-            out: &mut out,
-            sum: Checksum(0),
-        };
-        w.out.write_all(MAGIC_03).unwrap();
-        w.block(&serde_json::to_vec(&snapshot.header()).unwrap())
-            .unwrap();
-        let (names, dirs, rows) = snapshot.entries.parts();
-        w.u64(dirs.len() as u64).unwrap();
-        for i in 0..dirs.len() {
-            w.block(&dirs.path(i)).unwrap();
-        }
-        w.block(names).unwrap();
-        w.u64(rows.len() as u64).unwrap();
-        for row in rows {
-            let (offset, len) = row.name_range();
-            let mut record = [0_u8; ROW_BYTES_03];
-            record[0..8].copy_from_slice(&row.size.to_le_bytes());
-            record[8..16].copy_from_slice(&row.modified.to_le_bytes());
-            record[16..20].copy_from_slice(&offset.to_le_bytes());
-            record[20..24].copy_from_slice(&row.dir.to_le_bytes());
-            record[24..26].copy_from_slice(&len.to_le_bytes());
-            record[26] = kind_byte(row.kind);
-            record[27..35].copy_from_slice(&row.created.to_le_bytes());
-            w.bytes(&record).unwrap();
-        }
-        let sum = w.sum.0;
-        out.extend_from_slice(&sum.to_le_bytes());
-        fs::write(dir.join(INDEX), out).unwrap();
-    }
-    #[test]
-    fn indexes_from_version_0_8_load_with_item_counts() {
-        let temp = tempfile::tempdir().unwrap();
+    use crate::index::{Entry, Kind};
+
+    fn snapshot() -> Snapshot {
         let entry = |path: &str, kind, size| Entry::new(path.as_bytes().to_vec(), kind, size, 5);
-        let snapshot = Snapshot {
+        Snapshot {
             roots: vec![b"/d".to_vec()],
             entries: Table::from_entries(vec![
                 entry("/d", Kind::Folder, 0),
@@ -450,21 +423,43 @@ mod tests {
             ]),
             generation: 3,
             ..Snapshot::default()
-        };
-        save_03(temp.path(), &snapshot);
+        }
+    }
+
+    #[test]
+    fn round_trip_maps_the_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = snapshot();
+        save(temp.path(), &snapshot).unwrap();
         let old = load(temp.path()).unwrap();
         assert_eq!(old.entries.entries(), snapshot.entries.entries());
-        assert_eq!(old.entries.row(0).items, 3);
+        assert_eq!(old.entries.items(0), 3);
         assert_eq!(old.entries.row(0).size, 30);
-        save(temp.path(), &old).unwrap();
-        let mut magic = [0; 8];
-        File::open(temp.path().join(INDEX))
-            .unwrap()
-            .read_exact(&mut magic)
-            .unwrap();
-        assert_eq!(&magic, MAGIC);
-        let new = load(temp.path()).unwrap();
-        assert_eq!(new.entries.entries(), snapshot.entries.entries());
-        assert_eq!(new.generation, 3);
+        assert_eq!(old.generation, 3);
+        old.entries.trim();
+        assert_eq!(old.entries.entries(), snapshot.entries.entries());
+    }
+
+    #[test]
+    fn corrupt_index_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        save(temp.path(), &snapshot()).unwrap();
+        let path = temp.path().join(INDEX);
+        let mut bytes = fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        assert!(load(temp.path()).is_err());
+
+        fs::write(&path, &bytes[..bytes.len() - 4]).unwrap();
+        assert!(load(temp.path()).is_err());
+    }
+
+    #[test]
+    fn old_cache_is_treated_as_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join(INDEX), b"FMNIDX04-old-cache").unwrap();
+        let snapshot = load(temp.path()).unwrap();
+        assert!(snapshot.entries.is_empty());
     }
 }

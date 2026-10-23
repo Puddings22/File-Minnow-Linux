@@ -104,7 +104,7 @@ fn duplicates(
     let mut bits = Bits::zeros(table.len());
     let sized = by.size || by.content;
     if sized {
-        rows.retain(|&i| table.row(i).kind == Kind::File && table.row(i).size > 0);
+        rows.retain(|&i| table.row(i).kind() == Kind::File && table.row(i).size > 0);
     }
     let key = |i: usize| {
         (
@@ -855,16 +855,16 @@ impl View for RowView<'_> {
         self.table.name(self.index)
     }
     fn kind(&self) -> Kind {
-        self.table.row(self.index).kind
+        self.table.row(self.index).kind()
     }
     fn size(&self) -> u64 {
         self.table.row(self.index).size
     }
     fn modified(&self) -> i64 {
-        self.table.row(self.index).modified
+        i64::from(self.table.row(self.index).modified)
     }
     fn created(&self) -> i64 {
-        self.table.row(self.index).created
+        self.table.row(self.index).created()
     }
     fn path(&mut self) -> &[u8] {
         if !self.built {
@@ -889,7 +889,7 @@ impl View for RowView<'_> {
         whole: bool,
         dir_hits: &[bool],
     ) -> bool {
-        let dir = self.table.row(self.index).dir;
+        let dir = self.table.row(self.index).dir();
         if dir == NO_DIR {
             return contains(self.table.name(self.index), needle, case, whole);
         }
@@ -950,7 +950,7 @@ impl Expr {
                 let dir_rows = table.dir_rows();
                 let mut parents = vec![false; table.len()];
                 for i in 0..table.len() {
-                    let dir = table.row(i).dir;
+                    let dir = table.row(i).dir();
                     if dir != NO_DIR
                         && dir_rows[dir as usize] != u32::MAX
                         && name_is(table.name(i), needle)
@@ -1208,8 +1208,13 @@ fn name_hits(
         names,
         rows.len(),
         |i| {
-            let (offset, len) = rows[i].name_range();
-            (offset as usize, offset as usize + len as usize)
+            let offset = rows[i].name_offset() as usize;
+            let end = if i + 1 < rows.len() {
+                rows[i + 1].name_offset() as usize
+            } else {
+                names.len()
+            };
+            (offset, end)
         },
         needle.bytes(case),
         case,
@@ -1316,7 +1321,7 @@ impl Expr {
                         bail!("Query cancelled");
                     }
                     let row = table.row(i);
-                    if row.kind != Kind::File || row.size > CONTENT_MAX_BYTES {
+                    if row.kind() != Kind::File || row.size > CONTENT_MAX_BYTES {
                         continue;
                     }
                     table.write_path(i, &mut path);
@@ -1361,7 +1366,8 @@ impl Expr {
                     let mut bits = name_hits(table, needle, *case, false, cancel)?;
                     let (_, _, rows) = table.parts();
                     for (i, row) in rows.iter().enumerate() {
-                        if row.dir != NO_DIR && dir_hits[row.dir as usize] {
+                        let dir = row.dir();
+                        if dir != NO_DIR && dir_hits[dir as usize] {
                             bits.set(i);
                         }
                     }
@@ -1381,9 +1387,9 @@ impl Expr {
                 case,
                 prefix,
             } => per_row(&mut |i| affix(table.name(i), needle, *case, *prefix))?,
-            Self::Kind(kind) => per_row(&mut |i| table.row(i).kind == *kind)?,
+            Self::Kind(kind) => per_row(&mut |i| table.row(i).kind() == *kind)?,
             Self::Ext(extensions) => per_row(&mut |i| {
-                table.row(i).kind == Kind::File && {
+                table.row(i).kind() == Kind::File && {
                     let name = table.name(i);
                     name.iter().rposition(|b| *b == b'.').is_some_and(|dot| {
                         extensions
@@ -1394,11 +1400,11 @@ impl Expr {
             })?,
             Self::Size(range) => per_row(&mut |i| {
                 let row = table.row(i);
-                sized(row.kind) && range.contains(row.size as i128)
+                sized(row.kind()) && range.contains(row.size as i128)
             })?,
             Self::Date(range) => per_row(&mut |i| range.contains(table.row(i).modified as i128))?,
             Self::Created(range) => per_row(&mut |i| {
-                let created = table.row(i).created;
+                let created = table.row(i).created();
                 created != NO_DATE && range.contains(created as i128)
             })?,
             Self::Child { rows, .. } => per_row(&mut |i| rows.get(i) == Some(&true))?,
@@ -1411,7 +1417,7 @@ impl Expr {
             }
             Self::Empty => per_row(&mut |i| table.is_empty_folder(i))?,
             Self::Parent { dirs, .. } => per_row(&mut |i| {
-                let dir = table.row(i).dir;
+                let dir = table.row(i).dir();
                 dir != NO_DIR && dirs.get(dir as usize) == Some(&true)
             })?,
         })
@@ -1600,14 +1606,14 @@ pub fn search(
                     let row = table.row(*i as usize);
                     match request.sort {
                         Sort::Size => row.size as i128,
-                        Sort::Created => row.created as i128,
-                        Sort::Items => i128::from(row.items),
+                        Sort::Created => row.created() as i128,
+                        Sort::Items => i128::from(table.items(*i as usize)),
                         _ => row.modified as i128,
                     }
                 };
                 let by_type = |a: &u32, b: &u32| {
                     let (a, b) = (*a as usize, *b as usize);
-                    let folder = |i: usize| table.row(i).kind != Kind::Folder;
+                    let folder = |i: usize| table.row(i).kind() != Kind::Folder;
                     let lower =
                         |i: usize| extension(table.name(i)).iter().map(u8::to_ascii_lowercase);
                     folder(a)

@@ -713,9 +713,11 @@ impl Worker {
                     update_cost = update_started.elapsed().min(Duration::from_secs(3));
                 }
                 if let Some(next) = next {
+                    let unchanged = next.generation == current.generation;
                     // What changed on disk goes to the history; an update
                     // caused by other settings (roots, exclusions) does not.
-                    if next.config == current.config
+                    if !unchanged
+                        && next.config == current.config
                         && next.roots == current.roots
                         && !current.entries.is_empty()
                     {
@@ -732,7 +734,7 @@ impl Worker {
                                 format!("Cannot record changes: {e}");
                         }
                     }
-                    let persisted = if full || quick {
+                    let persisted = if (full || quick) && !unchanged {
                         {
                             let mut s = state.write().unwrap();
                             s.status.phase = "saving".into();
@@ -747,11 +749,21 @@ impl Worker {
                             Some(Instant::now())
                         };
                         result
+                    } else if unchanged {
+                        Ok(())
                     } else {
                         unsaved.get_or_insert_with(Instant::now);
                         Ok(())
                     };
-                    current = Arc::new(next);
+                    // After a save, keep the index mapped instead of holding
+                    // the builder's heap copy. Reloading is cheap and the
+                    // pages can be dropped again when idle.
+                    let mapped = if (full || quick) && persisted.is_ok() {
+                        store::load(dir).ok()
+                    } else {
+                        None
+                    };
+                    current = Arc::new(mapped.unwrap_or(next));
                     let mut s = state.write().unwrap();
                     s.snapshot = current.clone();
                     s.status.scanning = false;
@@ -775,6 +787,9 @@ impl Worker {
                     signals.notify(state);
                     // The previous index was just released; hand freed pages back.
                     release_memory();
+                    // A mapped, unchanged index can go back to the page cache
+                    // until the next query needs it.
+                    current.entries.trim();
                     if full {
                         reset_deadlines(&config, &mut deadlines);
                     }

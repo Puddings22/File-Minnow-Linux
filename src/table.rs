@@ -7,7 +7,14 @@
 //! contiguous range, and lets the builder deduplicate parent directories with
 //! a stack of the current ancestors instead of a hash map.
 use crate::index::{Entry, Kind};
-use std::{cmp::Ordering, path::PathBuf, sync::OnceLock};
+use bytemuck::{Pod, Zeroable};
+use memmap2::Mmap;
+use std::{
+    cmp::Ordering,
+    ops::{Deref, DerefMut},
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 
 /// Names buffer, parent folder paths and rows, for storage and scanning.
 pub(crate) type Parts<'a> = (&'a [u8], &'a Dirs, &'a [Row]);
@@ -17,42 +24,300 @@ pub const NO_DIR: u32 = u32::MAX;
 
 /// Unknown creation time (the filesystem does not record one).
 pub const NO_DATE: i64 = i64::MIN;
+/// Creation time that does not fit in the packed row, or is unknown.
+const NO_DATE_U32: u32 = u32::MAX;
+/// Directory ids use the low 30 bits of `dir_kind`; the top two hold `Kind`.
+const DIR_BITS: u32 = 30;
+const DIR_MASK: u32 = (1 << DIR_BITS) - 1;
 
-// The item count fits in what was padding: a row stays 40 bytes.
-const _: () = assert!(std::mem::size_of::<Row>() == 40);
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A read-only slice of the mmap-backed index file.
+#[derive(Clone)]
+pub(crate) struct MappedSlice {
+    map: Arc<Mmap>,
+    start: usize,
+    len: usize,
+}
+impl MappedSlice {
+    pub(crate) fn new(map: Arc<Mmap>, start: usize, len: usize) -> Self {
+        Self { map, start, len }
+    }
+    fn bytes(&self) -> &[u8] {
+        &self.map[self.start..self.start + self.len]
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+    fn trim(&self) {
+        // SAFETY: the mapping is page-aligned and `len` is the mapping length.
+        // Discarding clean file-backed pages only makes them fault in again.
+        unsafe {
+            libc::madvise(
+                self.map.as_ptr() as *mut libc::c_void,
+                self.map.len(),
+                libc::MADV_DONTNEED,
+            );
+        }
+    }
+}
+impl std::fmt::Debug for MappedSlice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedSlice")
+            .field("start", &self.start)
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+/// A byte buffer that is either owned by the builder or mapped from the
+/// saved index.
+#[derive(Clone, Debug)]
+pub(crate) enum Blob {
+    Owned(Vec<u8>),
+    Mapped(MappedSlice),
+}
+impl Default for Blob {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+impl Blob {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(mapped) => mapped.bytes(),
+        }
+    }
+    fn as_mut_vec(&mut self) -> &mut Vec<u8> {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(_) => panic!("mapped index is immutable"),
+        }
+    }
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Owned(bytes) => bytes.capacity(),
+            Self::Mapped(_) => 0,
+        }
+    }
+    fn shrink_to_fit(&mut self) {
+        if let Self::Owned(bytes) = self {
+            bytes.shrink_to_fit();
+        }
+    }
+    fn trim(&self) {
+        if let Self::Mapped(mapped) = self {
+            mapped.trim();
+        }
+    }
+}
+impl Deref for Blob {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+impl DerefMut for Blob {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.as_mut_vec()
+    }
+}
+
+/// Rows that are either built in memory or mapped from the saved index.
+#[derive(Clone, Debug)]
+pub(crate) enum RowStore {
+    Owned(Vec<Row>),
+    Mapped(MappedSlice),
+}
+impl Default for RowStore {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+impl RowStore {
+    fn as_slice(&self) -> &[Row] {
+        match self {
+            Self::Owned(rows) => rows,
+            Self::Mapped(mapped) => bytemuck::cast_slice(mapped.bytes()),
+        }
+    }
+    fn as_mut_slice(&mut self) -> &mut [Row] {
+        match self {
+            Self::Owned(rows) => rows,
+            Self::Mapped(_) => panic!("mapped index is immutable"),
+        }
+    }
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Owned(rows) => rows.capacity() * std::mem::size_of::<Row>(),
+            Self::Mapped(_) => 0,
+        }
+    }
+    fn trim(&self) {
+        if let Self::Mapped(mapped) = self {
+            mapped.trim();
+        }
+    }
+}
+impl Deref for RowStore {
+    type Target = [Row];
+    fn deref(&self) -> &[Row] {
+        self.as_slice()
+    }
+}
+impl DerefMut for RowStore {
+    fn deref_mut(&mut self) -> &mut [Row] {
+        self.as_mut_slice()
+    }
+}
+
+/// Directory nodes that are either built in memory or mapped from the file.
+#[derive(Clone, Debug)]
+pub(crate) enum DirStore {
+    Owned(Vec<DirNode>),
+    Mapped(MappedSlice),
+}
+impl Default for DirStore {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+impl DirStore {
+    fn as_slice(&self) -> &[DirNode] {
+        match self {
+            Self::Owned(nodes) => nodes,
+            Self::Mapped(mapped) => bytemuck::cast_slice(mapped.bytes()),
+        }
+    }
+    fn as_mut_slice(&mut self) -> &mut [DirNode] {
+        match self {
+            Self::Owned(nodes) => nodes,
+            Self::Mapped(_) => panic!("mapped index is immutable"),
+        }
+    }
+    fn as_mut_vec(&mut self) -> &mut Vec<DirNode> {
+        match self {
+            Self::Owned(nodes) => nodes,
+            Self::Mapped(_) => panic!("mapped index is immutable"),
+        }
+    }
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Owned(nodes) => nodes.capacity() * std::mem::size_of::<DirNode>(),
+            Self::Mapped(_) => 0,
+        }
+    }
+    fn shrink_to_fit(&mut self) {
+        if let Self::Owned(nodes) = self {
+            nodes.shrink_to_fit();
+        }
+    }
+    fn trim(&self) {
+        if let Self::Mapped(mapped) = self {
+            mapped.trim();
+        }
+    }
+}
+impl Deref for DirStore {
+    type Target = [DirNode];
+    fn deref(&self) -> &[DirNode] {
+        self.as_slice()
+    }
+}
+impl DerefMut for DirStore {
+    fn deref_mut(&mut self) -> &mut [DirNode] {
+        self.as_mut_slice()
+    }
+}
+
+// A row is 24 bytes: size, modified, created, name offset and dir/kind.
+const _: () = assert!(std::mem::size_of::<Row>() == 24);
+const _: () = assert!(std::mem::size_of::<DirNode>() == 12);
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct Row {
     /// File size, or for a folder the total size of the indexed files
     /// inside it (computed by the builder).
     pub size: u64,
-    pub modified: i64,
-    /// Creation time, or `NO_DATE`.
-    pub created: i64,
+    pub modified: u32,
+    created: u32,
     name_offset: u32,
-    pub dir: u32,
-    /// For a folder, how many indexed files and folders are inside it, at
-    /// any depth (computed by the builder); 0 otherwise.
-    pub items: u32,
-    name_len: u16,
-    pub kind: Kind,
+    dir_kind: u32,
+}
+impl Row {
+    pub(crate) fn new(
+        size: u64,
+        modified: i64,
+        created: i64,
+        name_offset: u32,
+        dir: u32,
+        kind: Kind,
+    ) -> Self {
+        Self {
+            size,
+            modified: clamp_time(modified),
+            created: if created == NO_DATE {
+                NO_DATE_U32
+            } else {
+                clamp_time(created)
+            },
+            name_offset,
+            dir_kind: encode_dir_kind(dir, kind),
+        }
+    }
+    pub fn dir(&self) -> u32 {
+        let dir = self.dir_kind & DIR_MASK;
+        if dir == DIR_MASK { NO_DIR } else { dir }
+    }
+    pub fn kind(&self) -> Kind {
+        Kind::from_bits(self.dir_kind >> DIR_BITS)
+    }
+    pub fn created(&self) -> i64 {
+        if self.created == NO_DATE_U32 {
+            NO_DATE
+        } else {
+            i64::from(self.created)
+        }
+    }
+    pub(crate) fn name_offset(&self) -> u32 {
+        self.name_offset
+    }
+    pub(crate) fn dir_kind(&self) -> u32 {
+        self.dir_kind
+    }
+    pub(crate) fn created_raw(&self) -> u32 {
+        self.created
+    }
+}
+fn clamp_time(value: i64) -> u32 {
+    if value <= 0 {
+        0
+    } else {
+        value.min(i64::from(u32::MAX)) as u32
+    }
+}
+fn encode_dir_kind(dir: u32, kind: Kind) -> u32 {
+    let dir = if dir == NO_DIR { DIR_MASK } else { dir };
+    (kind.bits() << DIR_BITS) | dir
 }
 
 /// One directory in the parent-linked directory table. A root directory
 /// (`parent == NO_DIR`) stores its whole path as its name; every other node
 /// stores one component and is joined to its parent when a path is built.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct DirNode {
     pub parent: u32,
     pub name_off: u32,
     pub name_len: u16,
+    pub(crate) _pad: u16,
 }
 
 /// Directory names packed into one buffer plus one parent-linked node per
 /// directory (three allocations in total, instead of one per folder).
 #[derive(Clone, Debug, Default)]
 pub struct Dirs {
-    names: Vec<u8>,
-    nodes: Vec<DirNode>,
+    names: Blob,
+    nodes: DirStore,
 }
 impl Dirs {
     pub fn len(&self) -> usize {
@@ -70,10 +335,10 @@ impl Dirs {
         self.nodes[i].parent
     }
     pub fn nodes(&self) -> &[DirNode] {
-        &self.nodes
+        self.nodes.as_slice()
     }
     pub fn names(&self) -> &[u8] {
-        &self.names
+        self.names.as_slice()
     }
     /// Writes the full path of directory `i` into `out`, replacing its contents.
     pub fn write_path(&self, i: usize, out: &mut Vec<u8>) {
@@ -145,32 +410,43 @@ impl Dirs {
             id
         }
     }
-    pub(crate) fn from_full_paths<'a>(paths: impl Iterator<Item = &'a [u8]>) -> Self {
-        let mut dirs = Self::default();
-        let mut ancestors = Vec::new();
-        for path in paths {
-            dirs.intern(&mut ancestors, path);
-        }
-        dirs
-    }
-    pub(crate) fn from_parts(names: Vec<u8>, nodes: Vec<DirNode>) -> Self {
-        Self { names, nodes }
-    }
-    fn push(&mut self, parent: u32, name: &[u8]) -> Option<u32> {
-        if name.len() > u16::MAX as usize
-            || self.names.len() + name.len() > u32::MAX as usize
-            || self.nodes.len() >= NO_DIR as usize
+    pub(crate) fn from_mapped(names: MappedSlice, nodes: MappedSlice) -> Option<Self> {
+        if !nodes.len().is_multiple_of(std::mem::size_of::<DirNode>())
+            || !(nodes.bytes().as_ptr() as usize).is_multiple_of(std::mem::align_of::<DirNode>())
         {
             return None;
         }
-        let id = self.nodes.len() as u32;
-        let name_off = self.names.len() as u32;
-        self.nodes.push(DirNode {
+        let node_slice: &[DirNode] = bytemuck::cast_slice(nodes.bytes());
+        for (index, node) in node_slice.iter().enumerate() {
+            if u64::from(node.name_off) + u64::from(node.name_len) > names.len() as u64
+                || (node.parent != NO_DIR && node.parent as usize >= index)
+            {
+                return None;
+            }
+        }
+        Some(Self {
+            names: Blob::Mapped(names),
+            nodes: DirStore::Mapped(nodes),
+        })
+    }
+    fn push(&mut self, parent: u32, name: &[u8]) -> Option<u32> {
+        let names = self.names.as_mut_vec();
+        let nodes = self.nodes.as_mut_vec();
+        if name.len() > u16::MAX as usize
+            || names.len() + name.len() > u32::MAX as usize
+            || nodes.len() >= DIR_MASK as usize
+        {
+            return None;
+        }
+        let id = nodes.len() as u32;
+        let name_off = names.len() as u32;
+        nodes.push(DirNode {
             parent,
             name_off,
             name_len: name.len() as u16,
+            _pad: 0,
         });
-        self.names.extend_from_slice(name);
+        names.extend_from_slice(name);
         Some(id)
     }
     fn shrink_to_fit(&mut self) {
@@ -178,15 +454,21 @@ impl Dirs {
         self.nodes.shrink_to_fit();
     }
     fn heap_bytes(&self) -> usize {
-        self.names.capacity() + self.nodes.capacity() * std::mem::size_of::<DirNode>()
+        self.names.heap_bytes() + self.nodes.heap_bytes()
+    }
+    fn trim(&self) {
+        self.names.trim();
+        self.nodes.trim();
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Table {
-    names: Vec<u8>,
+    names: Blob,
     dirs: Dirs,
-    rows: Vec<Row>,
+    rows: RowStore,
+    /// Folder item counts only: `(row, items)`, sorted by row.
+    items: Vec<(u32, u32)>,
     name_order: OnceLock<Vec<u32>>,
     folded: OnceLock<Folded>,
 }
@@ -378,13 +660,28 @@ impl Table {
         &self.rows[i]
     }
     pub fn name(&self, i: usize) -> &[u8] {
-        let row = &self.rows[i];
-        &self.names[row.name_offset as usize..row.name_offset as usize + row.name_len as usize]
+        let start = self.rows[i].name_offset as usize;
+        let end = if i + 1 < self.rows.len() {
+            self.rows[i + 1].name_offset as usize
+        } else {
+            self.names.len()
+        };
+        &self.names[start..end]
+    }
+    /// Number of bytes in row `i`'s name.
+    pub fn name_len(&self, i: usize) -> usize {
+        self.name(i).len()
+    }
+    /// Items inside folder row `i`; zero for every other row.
+    pub fn items(&self, i: usize) -> u32 {
+        self.items
+            .binary_search_by_key(&(i as u32), |(row, _)| *row)
+            .map_or(0, |at| self.items[at].1)
     }
     /// Appends the parent folder path of row `i` to `out`. Returns false when
     /// the row has no parent (a filesystem root).
     pub fn write_dir_path(&self, i: usize, out: &mut Vec<u8>) -> bool {
-        let dir = self.rows[i].dir;
+        let dir = self.rows[i].dir();
         out.clear();
         if dir == NO_DIR {
             return false;
@@ -402,8 +699,9 @@ impl Table {
     /// Writes the full path of row `i` into `out`, replacing its contents.
     pub fn write_path(&self, i: usize, out: &mut Vec<u8>) {
         out.clear();
-        if self.rows[i].dir != NO_DIR {
-            self.dirs.write_path(self.rows[i].dir as usize, out);
+        let dir = self.rows[i].dir();
+        if dir != NO_DIR {
+            self.dirs.write_path(dir as usize, out);
             if !out.ends_with(b"/") {
                 out.push(b'/');
             }
@@ -417,26 +715,27 @@ impl Table {
     }
     pub fn entry(&self, i: usize) -> Entry {
         let row = &self.rows[i];
-        let mut entry =
-            Entry::new(self.path(i), row.kind, row.size, row.modified).created(row.created);
-        entry.items = row.items;
+        let mut entry = Entry::new(self.path(i), row.kind(), row.size, i64::from(row.modified))
+            .created(row.created());
+        entry.items = self.items(i);
         entry
     }
     /// Whether folder row `i` has no indexed entries inside it.
     pub fn is_empty_folder(&self, i: usize) -> bool {
-        if self.rows[i].kind != Kind::Folder {
+        if self.rows[i].kind() != Kind::Folder {
             return false;
         }
         let Some(next) = self.rows.get(i + 1) else {
             return true;
         };
-        if next.dir == NO_DIR {
+        let dir = next.dir();
+        if dir == NO_DIR {
             return true;
         }
         let mut path = Vec::new();
         self.write_path(i, &mut path);
         let mut dir_path = Vec::new();
-        self.dirs.write_path(next.dir as usize, &mut dir_path);
+        self.dirs.write_path(dir as usize, &mut dir_path);
         dir_path != path
     }
     /// For each parent folder path (by `dir` id), the row of that folder, or
@@ -446,12 +745,12 @@ impl Table {
         let mut path = Vec::new();
         let mut dir_path = Vec::new();
         for j in 1..self.rows.len() {
-            let dir = self.rows[j].dir;
+            let dir = self.rows[j].dir();
             // The first child follows its folder directly in path order, so
             // only that child needs the comparison.
             if dir != NO_DIR
                 && dir_rows[dir as usize] == u32::MAX
-                && self.rows[j - 1].kind == Kind::Folder
+                && self.rows[j - 1].kind() == Kind::Folder
             {
                 self.write_path(j - 1, &mut path);
                 self.dirs.write_path(dir as usize, &mut dir_path);
@@ -470,10 +769,10 @@ impl Table {
         (0..self.len()).map(move |index| EntryRef {
             table: self,
             index,
-            kind: self.rows[index].kind,
+            kind: self.rows[index].kind(),
             size: self.rows[index].size,
-            modified: self.rows[index].modified,
-            created: self.rows[index].created,
+            modified: i64::from(self.rows[index].modified),
+            created: self.rows[index].created(),
         })
     }
     pub fn from_entries(mut entries: Vec<Entry>) -> Self {
@@ -487,13 +786,20 @@ impl Table {
     }
     /// Approximate heap bytes held by the table, for status reporting.
     pub fn heap_bytes(&self) -> usize {
-        self.names.capacity()
-            + self.rows.capacity() * std::mem::size_of::<Row>()
+        self.names.heap_bytes()
+            + self.rows.heap_bytes()
+            + self.items.capacity() * std::mem::size_of::<(u32, u32)>()
             + self.dirs.heap_bytes()
             + self.name_order.get().map_or(0, |o| o.capacity() * 4)
             + self.folded.get().map_or(0, |f| {
                 f.bytes.capacity() + f.ends.capacity() * 4 + f.rows.capacity() * 4
             })
+    }
+    /// Drops clean mapped pages; the next query faults them back in.
+    pub fn trim(&self) {
+        self.names.trim();
+        self.dirs.trim();
+        self.rows.trim();
     }
     /// First row whose path is not before `path` in component order.
     pub fn lower_bound(&self, path: &[u8]) -> usize {
@@ -656,44 +962,56 @@ impl Table {
         let _ = self.name_order.set(order);
     }
     pub(crate) fn parts(&self) -> Parts<'_> {
-        (&self.names, &self.dirs, &self.rows)
+        (self.names.as_slice(), &self.dirs, self.rows.as_slice())
     }
-    pub(crate) fn from_parts(names: Vec<u8>, dirs: Dirs, rows: Vec<Row>) -> Self {
+    pub(crate) fn item_entries(&self) -> &[(u32, u32)] {
+        &self.items
+    }
+    pub(crate) fn from_parts(
+        names: Blob,
+        dirs: Dirs,
+        rows: RowStore,
+        items: Vec<(u32, u32)>,
+    ) -> Self {
         Self {
             names,
             dirs,
             rows,
+            items,
             name_order: OnceLock::new(),
             folded: OnceLock::new(),
         }
     }
-}
-
-impl Row {
-    pub(crate) fn name_range(&self) -> (u32, u16) {
-        (self.name_offset, self.name_len)
-    }
-    #[allow(clippy::too_many_arguments)] // one per stored field
-    pub(crate) fn from_raw(
-        size: u64,
-        modified: i64,
-        created: i64,
-        name_offset: u32,
-        dir: u32,
-        items: u32,
-        name_len: u16,
-        kind: Kind,
-    ) -> Self {
-        Self {
-            size,
-            modified,
-            created,
-            name_offset,
-            dir,
-            items,
-            name_len,
-            kind,
+    pub(crate) fn from_mapped(
+        names: MappedSlice,
+        dirs: Dirs,
+        rows: MappedSlice,
+        items: Vec<(u32, u32)>,
+    ) -> Option<Self> {
+        if !rows.len().is_multiple_of(std::mem::size_of::<Row>())
+            || !(rows.bytes().as_ptr() as usize).is_multiple_of(std::mem::align_of::<Row>())
+        {
+            return None;
         }
+        let row_slice: &[Row] = bytemuck::cast_slice(rows.bytes());
+        let mut previous = 0_u32;
+        for (index, row) in row_slice.iter().enumerate() {
+            let offset = row.name_offset();
+            if offset < previous || offset as usize > names.len() || (index == 0 && offset != 0) {
+                return None;
+            }
+            previous = offset;
+            let dir = row.dir();
+            if dir != NO_DIR && dir as usize >= dirs.len() {
+                return None;
+            }
+        }
+        Some(Self::from_parts(
+            Blob::Mapped(names),
+            dirs,
+            RowStore::Mapped(rows),
+            items,
+        ))
     }
 }
 
@@ -773,16 +1091,8 @@ impl Builder {
         };
         let name_offset = self.names.len() as u32;
         self.names.extend_from_slice(name);
-        self.rows.push(Row {
-            size,
-            modified,
-            created,
-            name_offset,
-            dir,
-            items: 0,
-            name_len: name.len() as u16,
-            kind,
-        });
+        self.rows
+            .push(Row::new(size, modified, created, name_offset, dir, kind));
         true
     }
     /// Copies rows `start..end` of an existing table. Names move as one block
@@ -791,26 +1101,26 @@ impl Builder {
         if start >= end {
             return;
         }
-        let first = table.rows[start].name_offset as usize;
-        let last = &table.rows[end - 1];
-        let stop = last.name_offset as usize + last.name_len as usize;
+        let first = table.rows[start].name_offset() as usize;
+        let stop = table.rows[end - 1].name_offset() as usize + table.name_len(end - 1);
         let shift = self.names.len() as i64 - first as i64;
         self.names.extend_from_slice(&table.names[first..stop]);
         let (mut old_dir, mut new_dir) = (NO_DIR, NO_DIR);
         let mut dir_path = Vec::new();
         for row in &table.rows[start..end] {
-            if row.dir != old_dir {
-                old_dir = row.dir;
-                new_dir = if row.dir == NO_DIR {
+            let dir = row.dir();
+            if dir != old_dir {
+                old_dir = dir;
+                new_dir = if dir == NO_DIR {
                     NO_DIR
                 } else {
-                    table.dirs.write_path(row.dir as usize, &mut dir_path);
+                    table.dirs.write_path(dir as usize, &mut dir_path);
                     self.intern(&dir_path)
                 };
             }
             self.rows.push(Row {
-                name_offset: (i64::from(row.name_offset) + shift) as u32,
-                dir: new_dir,
+                name_offset: (i64::from(row.name_offset()) + shift) as u32,
+                dir_kind: encode_dir_kind(new_dir, row.kind()),
                 ..*row
             });
         }
@@ -826,7 +1136,7 @@ impl Builder {
         self.names.extend_from_slice(table.name(i));
         self.rows.push(Row {
             name_offset,
-            dir,
+            dir_kind: encode_dir_kind(dir, row.kind()),
             ..row
         });
     }
@@ -834,7 +1144,12 @@ impl Builder {
         self.names.shrink_to_fit();
         self.rows.shrink_to_fit();
         self.dirs.shrink_to_fit();
-        let mut table = Table::from_parts(self.names, self.dirs, self.rows);
+        let mut table = Table::from_parts(
+            Blob::Owned(self.names),
+            self.dirs,
+            RowStore::Owned(self.rows),
+            Vec::new(),
+        );
         table.sum_folder_sizes();
         table
     }
@@ -857,10 +1172,11 @@ impl Table {
         let mut open: Vec<Open> = Vec::new();
         let mut current_dir = u32::MAX - 1;
         let mut dir_path: Vec<u8> = Vec::new();
-        let close = |open: &mut Vec<Open>, rows: &mut [Row]| {
+        let mut item_rows: Vec<(u32, u32)> = Vec::new();
+        let close = |open: &mut Vec<Open>, rows: &mut [Row], item_rows: &mut Vec<(u32, u32)>| {
             if let Some(done) = open.pop() {
                 rows[done.row].size = done.size;
-                rows[done.row].items = done.items.min(u64::from(u32::MAX)) as u32;
+                item_rows.push((done.row as u32, done.items.min(u64::from(u32::MAX)) as u32));
                 if let Some(parent) = open.last_mut() {
                     parent.size += done.size;
                     parent.items += done.items;
@@ -869,23 +1185,24 @@ impl Table {
         };
         for i in 0..self.rows.len() {
             let row = self.rows[i];
-            if row.dir != current_dir {
-                current_dir = row.dir;
+            let dir = row.dir();
+            if dir != current_dir {
+                current_dir = dir;
                 dir_path.clear();
-                if row.dir != NO_DIR {
-                    self.dirs.write_path(row.dir as usize, &mut dir_path);
+                if dir != NO_DIR {
+                    self.dirs.write_path(dir as usize, &mut dir_path);
                 }
                 while open
                     .last()
-                    .is_some_and(|o| row.dir == NO_DIR || !within(&dir_path, &o.path))
+                    .is_some_and(|o| dir == NO_DIR || !within(&dir_path, &o.path))
                 {
-                    close(&mut open, &mut self.rows);
+                    close(&mut open, &mut self.rows, &mut item_rows);
                 }
             }
             if let Some(parent) = open.last_mut() {
                 parent.items += 1;
             }
-            match row.kind {
+            match row.kind() {
                 Kind::Folder => {
                     let mut path = Vec::new();
                     self.write_path(i, &mut path);
@@ -908,8 +1225,10 @@ impl Table {
             }
         }
         while !open.is_empty() {
-            close(&mut open, &mut self.rows);
+            close(&mut open, &mut self.rows, &mut item_rows);
         }
+        item_rows.sort_unstable_by_key(|(row, _)| *row);
+        self.items = item_rows;
     }
 }
 
@@ -946,7 +1265,7 @@ mod tests {
         assert_eq!(size_of(b"/d/sub/deep"), 1000);
         assert_eq!(size_of(b"/d/zed"), 0);
         assert_eq!(size_of(b"/e"), 7);
-        let items_of = |path: &[u8]| t.row(t.lower_bound(path)).items;
+        let items_of = |path: &[u8]| t.items(t.lower_bound(path));
         assert_eq!(items_of(b"/d"), 8);
         assert_eq!(items_of(b"/d/sub"), 4);
         assert_eq!(items_of(b"/d/zed"), 0);
@@ -956,7 +1275,7 @@ mod tests {
         assert!(!t.is_empty_folder(t.lower_bound(b"/d/sub")));
         assert!(!t.is_empty_folder(t.lower_bound(b"/d/a.txt")));
         let dir_rows = t.dir_rows();
-        let dir_of = |path: &[u8]| t.row(t.lower_bound(path)).dir as usize;
+        let dir_of = |path: &[u8]| t.row(t.lower_bound(path)).dir() as usize;
         assert_eq!(
             dir_rows[dir_of(b"/d/sub/b.txt")] as usize,
             t.lower_bound(b"/d/sub")

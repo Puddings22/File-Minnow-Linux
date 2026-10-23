@@ -126,11 +126,11 @@ fn compare(
     let change = |table: &Table, row: usize, path: &[u8], action| Change {
         time,
         action,
-        kind: table.row(row).kind,
+        kind: table.row(row).kind(),
         path: RawPath(path.to_vec()),
         to: None,
         size: table.row(row).size,
-        stamp: (table.row(row).modified, table.row(row).created),
+        stamp: (i64::from(table.row(row).modified), table.row(row).created()),
     };
     while (i < old_end || j < new_end) && out.len() <= MAX_PER_UPDATE {
         if i < old_end {
@@ -155,10 +155,10 @@ fn compare(
             }
             Ordering::Equal => {
                 let (x, y) = (old.row(i), new.row(j));
-                if x.kind != y.kind {
+                if x.kind() != y.kind() {
                     out.push(change(old, i, &a, Action::Deleted));
                     out.push(change(new, j, &b, Action::Created));
-                } else if y.kind == Kind::File && (x.size != y.size || x.modified != y.modified) {
+                } else if y.kind() == Kind::File && (x.size != y.size || x.modified != y.modified) {
                     out.push(change(new, j, &b, Action::Modified));
                 }
                 i += 1;

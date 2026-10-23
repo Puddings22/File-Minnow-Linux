@@ -14,7 +14,7 @@ fn main() {
     // Pick a folder from the middle of the index as the "changed" one.
     let table = &snapshot.entries;
     let folder = (table.len() / 2..table.len())
-        .find(|i| table.row(*i).kind == file_minnow::index::Kind::Folder)
+        .find(|i| table.row(*i).kind() == file_minnow::index::Kind::Folder)
         .expect("a folder");
     let changed = BTreeSet::from([PathBuf::from(std::ffi::OsString::from_vec(
         table.path(folder),
