@@ -170,11 +170,23 @@ pub enum Request {
     Search(SearchRequest),
     Status,
     Rescan,
-    RescanRoot { path: crate::config::RawPath },
-    Pause { paused: bool },
+    RescanRoot {
+        path: crate::config::RawPath,
+    },
+    Pause {
+        paused: bool,
+    },
     Settings,
-    SetSettings { settings: Box<Settings> },
-    Watch { after: u64 },
+    SetSettings {
+        settings: Box<Settings>,
+    },
+    Watch {
+        after: u64,
+    },
+    /// Records files opened or launched through the app, one increment each.
+    RecordRuns {
+        paths: Vec<crate::config::RawPath>,
+    },
     Shutdown,
     Pulse,
 }
@@ -219,7 +231,7 @@ fn handle_client(mut stream: UnixStream, handle: &Handle) {
         match serde_json::from_str::<Request>(&line)? {
             Request::Search(r) => {
                 let snapshot = handle.state.read().unwrap().snapshot.clone();
-                search = Some(query::search(&snapshot, &r, None)?);
+                search = Some(query::search(&snapshot, &r, None, Some(&handle.counts))?);
             }
             Request::Status => {}
             Request::Rescan => handle.rescan(None)?,
@@ -231,6 +243,10 @@ fn handle_client(mut stream: UnixStream, handle: &Handle) {
             }
             Request::Watch { after } => {
                 handle.wait_for_change(after, Duration::from_secs(55));
+            }
+            Request::RecordRuns { paths } => {
+                let paths: Vec<std::path::PathBuf> = paths.iter().map(|p| p.path()).collect();
+                handle.record_runs(&paths);
             }
             Request::Shutdown => handle.shutdown(),
             Request::Pulse => handle.pulse(),

@@ -19,6 +19,7 @@ pub mod query;
 pub mod rename;
 #[cfg(feature = "gui")]
 pub mod rename_ui;
+pub mod run_counts;
 pub mod runtime;
 #[cfg(feature = "gui")]
 pub mod search_provider;

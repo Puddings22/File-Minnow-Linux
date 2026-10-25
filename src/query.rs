@@ -1489,6 +1489,9 @@ pub enum Sort {
     Created,
     /// The number of entries inside a folder.
     Items,
+    /// Times the file was opened or launched through File Minnow. Needs the
+    /// run counts; without them every result compares equal (name order).
+    RunCount,
 }
 /// The extension of a file name (after the last dot; none for `.hidden`).
 pub fn extension(name: &[u8]) -> &[u8] {
@@ -1522,11 +1525,16 @@ pub struct SearchResponse {
     pub total: usize,
     pub generation: u64,
     pub elapsed_ms: f64,
+    /// Run counts aligned with `entries`, from the service's counter store;
+    /// empty when the search was run without one.
+    #[serde(default)]
+    pub counts: Vec<u32>,
 }
 pub fn search(
     snapshot: &Snapshot,
     request: &SearchRequest,
     cancellation: Option<(&AtomicU64, u64)>,
+    run_counts: Option<&crate::run_counts::RunCounts>,
 ) -> Result<SearchResponse> {
     let started = std::time::Instant::now();
     let cancelled = || cancellation.is_some_and(|(a, n)| a.load(Ordering::Relaxed) != n);
@@ -1543,6 +1551,11 @@ pub fn search(
     };
     let wanted = |i: usize| bits.as_ref().is_none_or(|b| b.get(i));
     let total = bits.as_ref().map_or(table.len(), Bits::count);
+    // Keyed by raw path bytes so neither the comparator nor the page build
+    // converts index paths. Cloning the (small) counter store once per query
+    // keeps the sort free of repeated locking.
+    let counts_map: std::collections::HashMap<Vec<u8>, u32> =
+        run_counts.map_or_else(std::collections::HashMap::new, |c| c.snapshot());
     let page: Vec<u32> = if total <= request.offset || limit == 0 {
         Vec::new()
     } else {
@@ -1624,13 +1637,60 @@ pub fn search(
                 hits.sort_unstable_by(compare);
                 hits.into_iter().skip(request.offset).take(limit).collect()
             }
+            Sort::RunCount => {
+                let mut hits: Vec<u32> = match &bits {
+                    Some(bits) => bits.ones_iter().map(|i| i as u32).collect(),
+                    None => (0..table.len() as u32).collect(),
+                };
+                // The counter is not in the index, so pay one path lookup per
+                // match up front; comparisons then touch only the small
+                // counter table. Without counts everything is zero and the
+                // row order (path order) decides, like an empty column.
+                let count: std::collections::HashMap<u32, u32> = hits
+                    .iter()
+                    .filter_map(|i| counts_map.get(&table.path(*i as usize)).map(|c| (*i, *c)))
+                    .collect();
+                let compare = |a: &u32, b: &u32| {
+                    let order = count
+                        .get(a)
+                        .copied()
+                        .unwrap_or(0)
+                        .cmp(&count.get(b).copied().unwrap_or(0))
+                        .then(a.cmp(b));
+                    if request.descending {
+                        order.reverse()
+                    } else {
+                        order
+                    }
+                };
+                let needed = request.offset.saturating_add(limit).min(total);
+                if needed < hits.len() {
+                    hits.select_nth_unstable_by(needed, compare);
+                    hits.truncate(needed);
+                }
+                hits.sort_unstable_by(compare);
+                hits.into_iter().skip(request.offset).take(limit).collect()
+            }
         }
+    };
+    let counts: Vec<u32> = if counts_map.is_empty() {
+        Vec::new()
+    } else {
+        page.iter()
+            .map(|i| {
+                counts_map
+                    .get(&table.path(*i as usize))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .collect()
     };
     Ok(SearchResponse {
         entries: page.into_iter().map(|i| table.entry(i as usize)).collect(),
         total,
         generation: snapshot.generation,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.,
+        counts,
     })
 }
 

@@ -78,7 +78,7 @@ impl Searcher {
             Some(response) => response.entries,
             None => self
                 .saved_index()
-                .and_then(|s| crate::query::search(&s, &request, None).ok())
+                .and_then(|s| crate::query::search(&s, &request, None, None).ok())
                 .map(|r| r.entries)
                 .unwrap_or_default(),
         };

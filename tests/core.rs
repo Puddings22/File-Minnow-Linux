@@ -163,11 +163,49 @@ fn deterministic_pagination_and_cancellation() {
         sort: Sort::Name,
         ..Default::default()
     };
-    let r = query::search(&s, &req, None).unwrap();
+    let r = query::search(&s, &req, None, None).unwrap();
     assert_eq!(r.entries[0].name(), b"b");
     assert_eq!(r.total, 3);
     assert_eq!(r.generation, 4);
-    assert!(query::search(&s, &req, Some((&AtomicU64::new(2), 1))).is_err());
+    assert!(query::search(&s, &req, Some((&AtomicU64::new(2), 1)), None).is_err());
+}
+#[test]
+fn run_count_sort_and_page_counts() {
+    let s = index::Snapshot {
+        entries: file_minnow::table::Table::from_entries(vec![e("c"), e("a"), e("b")]),
+        generation: 1,
+        ..Default::default()
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let counts = file_minnow::run_counts::RunCounts::load(temp.path().join("run_counts.json"));
+    for _ in 0..3 {
+        counts.record(std::path::Path::new("/fixture/c"));
+    }
+    counts.record(std::path::Path::new("/fixture/a"));
+    let req = SearchRequest {
+        sort: Sort::RunCount,
+        descending: true,
+        limit: 10,
+        ..Default::default()
+    };
+    let r = query::search(&s, &req, None, Some(&counts)).unwrap();
+    assert_eq!(r.total, 3);
+    // Most-used first; the never-used row keeps path (row) order.
+    let names: Vec<Vec<u8>> = r.entries.iter().map(|x| x.name().to_vec()).collect();
+    assert_eq!(names, [b"c".to_vec(), b"a".to_vec(), b"b".to_vec()]);
+    assert_eq!(r.counts, vec![3, 1, 0]);
+    // Ascending: the never-used row comes first.
+    let req = SearchRequest {
+        sort: Sort::RunCount,
+        descending: false,
+        limit: 10,
+        ..Default::default()
+    };
+    let r = query::search(&s, &req, None, Some(&counts)).unwrap();
+    assert_eq!(r.counts, vec![0, 1, 3]);
+    // Without a counter store the page carries no counts.
+    let r = query::search(&s, &req, None, None).unwrap();
+    assert!(r.counts.is_empty());
 }
 #[test]
 fn everything_style_functions_and_folding() {
@@ -199,7 +237,7 @@ fn everything_style_functions_and_folding() {
             descending,
             ..Default::default()
         };
-        query::search(&s, &request, None)
+        query::search(&s, &request, None, None)
             .unwrap()
             .entries
             .iter()
@@ -248,6 +286,7 @@ fn everything_style_functions_and_folding() {
             ..Default::default()
         },
         None,
+        None,
     )
     .unwrap();
     let size_of = |name: &str| {
@@ -289,7 +328,7 @@ fn content_search_reads_only_candidate_files() {
             query: query.into(),
             ..Default::default()
         };
-        query::search(&s, &request, None)
+        query::search(&s, &request, None, None)
             .unwrap()
             .entries
             .iter()
@@ -331,7 +370,7 @@ fn type_sort_and_type_filters() {
             descending,
             ..Default::default()
         };
-        query::search(&s, &request, None)
+        query::search(&s, &request, None, None)
             .unwrap()
             .entries
             .iter()
@@ -574,7 +613,7 @@ fn duplicates_by_name_size_and_contents() {
             sort: Sort::Path,
             ..Default::default()
         };
-        query::search(&s, &request, None)
+        query::search(&s, &request, None, None)
             .unwrap()
             .entries
             .iter()
@@ -665,6 +704,7 @@ fn file_lists_are_indexed_under_a_folder() {
             query: "sunset".into(),
             ..Default::default()
         },
+        None,
         None,
     )
     .unwrap();

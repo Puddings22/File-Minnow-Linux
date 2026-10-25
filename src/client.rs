@@ -64,7 +64,7 @@ impl Backend {
         match self {
             Self::Local(h) => {
                 let snapshot = h.state.read().unwrap().snapshot.clone();
-                query::search(&snapshot, request, cancel)
+                query::search(&snapshot, request, cancel, Some(&h.counts))
             }
             Self::Remote { .. } => {
                 if cancel.is_some_and(|(v, id)| v.load(Ordering::Relaxed) != id) {
@@ -97,6 +97,18 @@ impl Backend {
         match self {
             Self::Local(h) => h.pause(value),
             Self::Remote { .. } => self.remote(Request::Pause { paused: value }).map(|_| ()),
+        }
+    }
+    /// Records files opened or launched through the app. The index service
+    /// owns the counters; a disconnected service is not the user's problem
+    /// at open time, so failures are dropped.
+    pub fn record_runs(&self, paths: &[PathBuf]) {
+        match self {
+            Self::Local(h) => h.record_runs(paths),
+            Self::Remote { .. } => {
+                let paths = paths.iter().map(|p| config::RawPath::new(p)).collect();
+                let _ = self.remote(Request::RecordRuns { paths });
+            }
         }
     }
     pub fn on_change(&self, callback: impl Fn() + Send + Sync + 'static) -> Subscription {

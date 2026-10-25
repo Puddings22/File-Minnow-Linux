@@ -55,7 +55,7 @@ struct WindowMemory {
     thumbnails: bool,
 }
 fn default_hidden() -> Vec<String> {
-    vec!["Created".into(), "Items".into()]
+    vec!["Created".into(), "Items".into(), "Run count".into()]
 }
 impl Default for WindowMemory {
     fn default() -> Self {
@@ -149,6 +149,8 @@ pub(crate) enum Message {
     Undone(Result<String, String>),
     /// A thumbnail for the grid: its generation, result index and pixels.
     Thumbnail(u64, u32, PreviewContent),
+    /// Run counts were just recorded off-thread; refresh the visible results.
+    RunsRecorded,
 }
 /// A thumbnail the grid asks for.
 struct ThumbJob {
@@ -1143,7 +1145,7 @@ const OPERATORS: &[(&str, &str)] = &[
     ("regex:", "regular expression"),
 ];
 /// Result columns: title, default width and sort key. Name is always shown.
-const COLUMNS: [(&str, i32, Sort); 7] = [
+const COLUMNS: [(&str, i32, Sort); 8] = [
     ("Name", 300, Sort::Name),
     ("Path", 400, Sort::Path),
     ("Size", 95, Sort::Size),
@@ -1151,6 +1153,7 @@ const COLUMNS: [(&str, i32, Sort); 7] = [
     ("Type", 140, Sort::Type),
     ("Created", 155, Sort::Created),
     ("Items", 70, Sort::Items),
+    ("Run count", 75, Sort::RunCount),
 ];
 fn build_columns(app: &AppRef) {
     let mut a = app.borrow_mut();
@@ -1200,7 +1203,7 @@ fn build_columns(app: &AppRef) {
         text.set_property("single-paragraph-mode", true);
         text.set_property("ypad", 1_u32);
         text.set_property("xpad", 3_u32);
-        if number == 2 || number == 6 {
+        if number == 2 || number == 6 || number == 7 {
             text.set_property("xalign", 1_f32);
         }
         gtk::prelude::TreeViewColumnExt::pack_start(&column, &text, true);
@@ -1216,7 +1219,10 @@ fn build_columns(app: &AppRef) {
                     return;
                 };
                 let rows = rows.borrow();
-                let Some(e) = rows.as_ref().and_then(|r| r.entries.get(i as usize)) else {
+                let Some(r) = rows.as_ref() else {
+                    return;
+                };
+                let Some(e) = r.entries.get(i as usize) else {
                     return;
                 };
                 // Entries of an unplugged drive are shown greyed.
@@ -1242,8 +1248,14 @@ fn build_columns(app: &AppRef) {
                     4 => type_name(&types, e),
                     5 => created(e),
                     // How many files and folders a folder holds, at any depth.
-                    _ => match e.kind {
+                    6 => match e.kind {
                         Kind::Folder => count(e.items as usize),
+                        _ => String::new(),
+                    },
+                    // Times the file was opened or launched through the app.
+                    // Blank when never used or when results carry no counters.
+                    _ => match r.counts.get(i as usize) {
+                        Some(c) if *c > 0 => count(*c as usize),
                         _ => String::new(),
                     },
                 };
@@ -1259,7 +1271,10 @@ fn build_columns(app: &AppRef) {
                     a.descending = !a.descending;
                 } else {
                     a.sort = sort;
-                    a.descending = matches!(sort, Sort::Size | Sort::Modified | Sort::Items);
+                    a.descending = matches!(
+                        sort,
+                        Sort::Size | Sort::Modified | Sort::Items | Sort::RunCount
+                    );
                 }
                 a.offset = 0;
                 a.show_sort();
@@ -2530,6 +2545,7 @@ impl App {
             Sort::Type => "Type",
             Sort::Created => "Created",
             Sort::Items => "Items",
+            Sort::RunCount => "Run count",
         };
         for c in self.tree.columns() {
             c.set_sort_indicator(c.title().as_deref() == Some(title));
@@ -2633,6 +2649,7 @@ impl App {
                 total: 0,
                 generation: self.last_generation,
                 elapsed_ms: 0.,
+                counts: Vec::new(),
             });
             return;
         }
@@ -2950,6 +2967,7 @@ impl App {
                 }
             }
             Message::Backend => app.borrow_mut().backend_changed(),
+            Message::RunsRecorded => app.borrow_mut().schedule(),
             Message::Search(id, result) => {
                 let mut a = app.borrow_mut();
                 if id != a.query_version.load(Ordering::Relaxed) {
@@ -3238,7 +3256,7 @@ impl App {
             );
             return;
         }
-        open_paths(paths, parent, self.messages.clone());
+        open_paths(paths, parent, self.messages.clone(), self.backend.clone());
     }
     fn copy_selected(&mut self, names: bool) {
         let text = self
@@ -3283,8 +3301,12 @@ impl App {
     }
     fn open_with(&mut self, info: &gio::AppInfo) {
         let paths = self.selected_paths();
-        if let Err(e) = file_ops::launch(info, &paths, self.launch_context().as_ref()) {
-            self.error(&format!("Cannot start {}: {e}", info.display_name()));
+        match file_ops::launch(info, &paths, self.launch_context().as_ref()) {
+            Ok(()) => {
+                self.backend.record_runs(&paths);
+                self.schedule();
+            }
+            Err(e) => self.error(&format!("Cannot start {}: {e}", info.display_name())),
         }
     }
     fn choose_application(&mut self) {
@@ -3298,13 +3320,21 @@ impl App {
         );
         let context = self.launch_context();
         let status = self.status.clone();
+        let backend = self.backend.clone();
+        let messages = self.messages.clone();
         dialog.connect_response(move |dialog, response| {
             if response == gtk::ResponseType::Ok
                 && let Some(info) = dialog.app_info()
-                && let Err(e) =
-                    file_ops::launch(&info, std::slice::from_ref(&path), context.as_ref())
             {
-                status.set_text(&format!("Cannot start {}: {e}", info.display_name()));
+                match file_ops::launch(&info, std::slice::from_ref(&path), context.as_ref()) {
+                    Ok(()) => {
+                        backend.record_runs(std::slice::from_ref(&path));
+                        let _ = messages.try_send(Message::RunsRecorded);
+                    }
+                    Err(e) => {
+                        status.set_text(&format!("Cannot start {}: {e}", info.display_name()));
+                    }
+                }
             }
             dialog.close();
         });
@@ -3322,10 +3352,11 @@ impl App {
             return;
         }
         let tx = self.messages.clone();
+        let backend = self.backend.clone();
         let fallback = paths.clone();
         file_ops::file_manager("ShowItems", &paths, move |answered| {
             if !answered {
-                open_paths(fallback, true, tx);
+                open_paths(fallback, true, tx, backend);
             }
         });
     }
@@ -3333,7 +3364,9 @@ impl App {
     fn portal_selected(&mut self, action: file_ops::Portal) {
         let paths = self.selected_paths();
         let tx = self.messages.clone();
+        let backend = self.backend.clone();
         std::thread::spawn(move || {
+            let mut recorded = false;
             for path in paths.iter().take(20) {
                 if let Err(e) = file_ops::portal(action, path) {
                     let _ = tx.send_blocking(Message::Error(format!(
@@ -3342,6 +3375,13 @@ impl App {
                     )));
                     break;
                 }
+                if matches!(action, file_ops::Portal::Open | file_ops::Portal::OpenWith) {
+                    backend.record_runs(std::slice::from_ref(path));
+                    recorded = true;
+                }
+            }
+            if recorded {
+                let _ = tx.send_blocking(Message::RunsRecorded);
             }
         });
     }
@@ -3484,8 +3524,9 @@ impl App {
             return;
         }
         let tx = a.messages.clone();
+        let backend = a.backend.clone();
         let open: crate::changes_ui::Open = Rc::new(move |path, folder| {
-            open_paths(vec![path], folder, tx.clone());
+            open_paths(vec![path], folder, tx.clone(), backend.clone());
         });
         let window = crate::changes_ui::ChangesWindow::new(&a.window, &a.data_dir, open);
         let weak = Rc::downgrade(app);
@@ -3784,8 +3825,15 @@ fn export_results(
     Ok(written)
 }
 /// Opens entries (or their folders) with the desktop's default applications.
-fn open_paths(paths: Vec<PathBuf>, parent: bool, tx: async_channel::Sender<Message>) {
+/// Opens of the files themselves (not their folders) are counted.
+fn open_paths(
+    paths: Vec<PathBuf>,
+    parent: bool,
+    tx: async_channel::Sender<Message>,
+    backend: Backend,
+) {
     std::thread::spawn(move || {
+        let mut recorded = false;
         for mut path in paths {
             if parent && let Some(p) = path.parent() {
                 path = p.to_path_buf();
@@ -3803,12 +3851,22 @@ fn open_paths(paths: Vec<PathBuf>, parent: bool, tx: async_channel::Sender<Messa
                         )
                     }
                 });
-            if let Err(error) = result {
-                let _ = tx.send_blocking(Message::Error(format!(
-                    "Cannot open {}: {error}",
-                    path.display()
-                )));
+            match result {
+                Ok(()) if !parent => {
+                    backend.record_runs(std::slice::from_ref(&path));
+                    recorded = true;
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    let _ = tx.send_blocking(Message::Error(format!(
+                        "Cannot open {}: {error}",
+                        path.display()
+                    )));
+                }
             }
+        }
+        if recorded {
+            let _ = tx.send_blocking(Message::RunsRecorded);
         }
     });
 }

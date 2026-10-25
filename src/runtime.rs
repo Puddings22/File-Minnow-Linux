@@ -91,6 +91,8 @@ pub struct Handle {
     pub state: Shared,
     settings: Arc<RwLock<Settings>>,
     config: ConfigStore,
+    /// Files opened or launched through the app, kept beside the settings.
+    pub counts: Arc<crate::run_counts::RunCounts>,
     commands: mpsc::SyncSender<Command>,
     wake: thread::Thread,
     signals: Arc<Signals>,
@@ -99,6 +101,10 @@ pub struct Handle {
     interrupt: Arc<AtomicBool>,
 }
 impl Handle {
+    /// Records opens or launches, one increment per path.
+    pub fn record_runs(&self, paths: &[std::path::PathBuf]) {
+        self.counts.record_all(paths);
+    }
     fn send(&self, command: Command) -> Result<()> {
         self.commands.send(command).context("Indexer has stopped")?;
         self.wake.unpark();
@@ -213,10 +219,14 @@ impl Runtime {
                 worker.signals.notify(&worker.state);
             }
         });
+        let counts = Arc::new(crate::run_counts::RunCounts::load(
+            crate::run_counts::RunCounts::path_for(&config.path),
+        ));
         let handle = Handle {
             state: state.clone(),
             settings,
             config,
+            counts,
             commands: tx,
             wake: thread.thread().clone(),
             signals,

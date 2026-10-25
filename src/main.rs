@@ -172,7 +172,7 @@ fn main() -> Result<()> {
                 req.offset = 0;
                 loop {
                     let page = match &saved {
-                        Some(s) => query::search(s, &req, None)?,
+                        Some(s) => query::search(s, &req, None, None)?,
                         None => {
                             let r = service::request(&dir, &Request::Search(req.clone()))?;
                             if let Some(e) = r.error {
@@ -205,7 +205,7 @@ fn main() -> Result<()> {
                 if s.generation == 0 {
                     bail!("No index yet. Run: file-minnow index --root /your/folder");
                 }
-                query::search(&s, &req, None)?
+                query::search(&s, &req, None, None)?
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);

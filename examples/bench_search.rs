@@ -42,6 +42,7 @@ fn main() {
             ..Default::default()
         },
         None,
+        None,
     )
     .unwrap();
     println!(
@@ -65,7 +66,7 @@ fn main() {
         let mut samples = Vec::new();
         let mut total = 0;
         for _ in 0..20 {
-            let result = search(&s, &r, None).unwrap();
+            let result = search(&s, &r, None, None).unwrap();
             samples.push(result.elapsed_ms);
             total = result.total;
             std::hint::black_box(result);

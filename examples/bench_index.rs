@@ -42,6 +42,7 @@ fn main() {
             ..Default::default()
         },
         None,
+        None,
     )
     .unwrap();
     println!(
@@ -70,10 +71,10 @@ fn main() {
                 ..Default::default()
             };
             let mut times: Vec<f64> = (0..7)
-                .map(|_| search(&snapshot, &request, None).unwrap().elapsed_ms)
+                .map(|_| search(&snapshot, &request, None, None).unwrap().elapsed_ms)
                 .collect();
             times.sort_by(f64::total_cmp);
-            let matches = search(&snapshot, &request, None).unwrap().total;
+            let matches = search(&snapshot, &request, None, None).unwrap().total;
             println!(
                 "{}",
                 serde_json::json!({"query": query, "sort": format!("{sort:?}"), "matches": matches, "median_ms": times[3], "max_ms": times[6]})
